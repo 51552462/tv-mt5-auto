@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: tv-mt5-hub
+    env: python
+    plan: free
+    buildCommand: pip install -r server/requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: DB_PATH
+        value: /tmp/signals.db
+      - key: AUTH_TOKEN
+        sync: false
+      - key: AGENT_KEY
+        sync: false
