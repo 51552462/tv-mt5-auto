@@ -1,211 +1,210 @@
-import os, time, json, requests, traceback
-from typing import Dict, List, Tuple
+# /agent/agent.py
+import os
+import time
+import requests
+from typing import Optional, Tuple
+
 import MetaTrader5 as mt5
 
-# ======== 환경설정 ========
-RENDER_BASE   = os.environ.get("RENDER_BASE")   # 예: https://tv-mt5-hub.onrender.com
-AGENT_KEY     = os.environ.get("AGENT_KEY")     # Render와 동일 값
-AUTH_HEADER   = {}  # Render /pull은 별도 AUTH 불필요 (AGENT_KEY로 인증)
-POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "1.2"))
+# ===================== 사용자 설정 =====================
+SERVER_URL   = os.environ.get("SERVER_URL",   "http://127.0.0.1:8000")
+AGENT_TOKEN  = os.environ.get("AGENT_TOKEN",  "set-me")
+POLL_SEC     = float(os.environ.get("POLL_SEC", "0.8"))
 
-MT5_LOGIN     = int(os.environ.get("MT5_LOGIN", "87912126"))
-MT5_PASSWORD  = os.environ.get("MT5_PASSWORD", "" )  # 트레이딩(마스터) 비번
-MT5_SERVER    = os.environ.get("MT5_SERVER", "InfinoxLimited-MT5Live")
+# 에이전트 현지(브로커)에 맞춘 최종 심볼 후보
+FINAL_ALIASES = {
+    "NQ1!": ["US100", "NAS100", "US100.cash", "NAS100.cash", "USTEC", "USTECH"]
+}
+# =======================================================
 
-ENTRY_UNITS     = int(os.environ.get("ENTRY_UNITS", "3"))     # 항상 3
-UNIT_LOT        = float(os.environ.get("UNIT_LOT", "0.01"))   # 1계약=0.01 lot 가정
-DEVIATION_POINTS = int(os.environ.get("DEVIATION", "30"))
-MAGIC           = int(os.environ.get("MAGIC", "91001"))
-COMMENT         = os.environ.get("COMMENT", "AutoTV3Units")
+def log(msg: str):
+    print(time.strftime("[%Y-%m-%d %H:%M:%S]"), msg, flush=True)
 
-# ======== MT5 연결 ========
 def init_mt5():
     if not mt5.initialize():
-        raise RuntimeError(f"mt5.initialize() failed: {mt5.last_error()}")
-    if not mt5.login(MT5_LOGIN, password=MT5_PASSWORD, server=MT5_SERVER):
-        raise RuntimeError(f"MT5 login failed: {mt5.last_error()}")
-    print("✅ MT5 로그인 성공")
+        raise RuntimeError(f"MT5 initialize failed: {mt5.last_error()}")
+    acc = mt5.account_info()
+    if acc is None:
+        raise RuntimeError("MT5 not logged in. Please login in the terminal first.")
+    log(f"MT5 ok: {acc.login}, {acc.company}, 'hedge' if acc.trade_mode==0 else 'netting?'")
 
-# ======== 유틸 ========
-def ensure_symbol(symbol: str):
+def resolve_symbol(tv_symbol: str, server_mt5_symbol: Optional[str]) -> str:
+    # 1) 서버가 추천한 심볼 우선
+    if server_mt5_symbol:
+        info = mt5.symbol_info(server_mt5_symbol)
+        if info:
+            if not info.visible:
+                mt5.symbol_select(server_mt5_symbol, True)
+            return server_mt5_symbol
+    # 2) 로컬 후보
+    for tv, candidates in FINAL_ALIASES.items():
+        if tv_symbol.upper() == tv.upper():
+            for c in candidates:
+                info = mt5.symbol_info(c)
+                if info:
+                    if not info.visible:
+                        mt5.symbol_select(c, True)
+                    return c
+    return tv_symbol
+
+def symbol_round_volume(symbol: str, vol: float) -> float:
     info = mt5.symbol_info(symbol)
-    if info is None:
-        raise RuntimeError(f"Symbol not found: {symbol}")
+    if not info:
+        return round(vol, 2)
+    step = info.volume_step or 0.01
+    vmin = info.volume_min or step
+    vmax = info.volume_max or max(100.0, vol)
+    snapped = round(round(vol/step)*step, 10)
+    if snapped < vmin: snapped = 0.0
+    if snapped > vmax: snapped = vmax
+    return snapped
+
+def get_position_summary(symbol: str) -> Tuple[str, float, float | None]:
+    """
+    returns (side, qty, avg_price)
+    side: 'long'|'short'|'flat'
+    qty : 양수 랏
+    """
+    positions = mt5.positions_get(symbol=symbol)
+    if positions is None or len(positions) == 0:
+        return ("flat", 0.0, None)
+
+    long_qty = 0.0
+    short_qty = 0.0
+    long_val = 0.0
+    short_val = 0.0
+
+    for p in positions:
+        if p.type == mt5.POSITION_TYPE_BUY:
+            long_qty += p.volume
+            long_val += p.price_open * p.volume
+        elif p.type == mt5.POSITION_TYPE_SELL:
+            short_qty += p.volume
+            short_val += p.price_open * p.volume
+
+    if long_qty > short_qty:
+        avg = (long_val/long_qty) if long_qty>0 else None
+        return ("long", long_qty - short_qty, avg)
+    elif short_qty > long_qty:
+        avg = (short_val/short_qty) if short_qty>0 else None
+        return ("short", short_qty - long_qty, avg)
+    else:
+        return ("flat", 0.0, None)
+
+def send_market_order(symbol: str, side: str, volume: float) -> bool:
+    info = mt5.symbol_info(symbol)
+    if not info:
+        log(f"[ERR] symbol_info None: {symbol}")
+        return False
     if not info.visible:
         mt5.symbol_select(symbol, True)
-    return mt5.symbol_info(symbol)
 
-def current_price(symbol: str, side: str) -> float:
-    info = mt5.symbol_info_tick(symbol)
-    if side == "buy":
-        return info.ask
-    return info.bid
+    vol = symbol_round_volume(symbol, volume)
+    if vol <= 0:
+        log(f"[SKIP] volume<=0 after rounding: req={volume}")
+        return True
 
-def send_deal(symbol: str, side: str, lot: float, close_ticket: int = None):
-    """시장가 체결. close_ticket 있으면 해당 포지션 부분청산"""
-    order_type = mt5.ORDER_TYPE_BUY if side == "buy" else mt5.ORDER_TYPE_SELL
-    price = current_price(symbol, side)
+    order_type = mt5.ORDER_TYPE_BUY if side=="long" else mt5.ORDER_TYPE_SELL
     req = {
         "action": mt5.TRADE_ACTION_DEAL,
         "symbol": symbol,
-        "volume": lot,
+        "volume": vol,
         "type": order_type,
-        "price": price,
-        "deviation": DEVIATION_POINTS,
-        "magic": MAGIC,
-        "comment": COMMENT,
-        "type_time": mt5.ORDER_TIME_GTC,
+        "deviation": 50,
+        "magic": 20251016,
+        "comment": "tv-mt5-agent",
         "type_filling": mt5.ORDER_FILLING_IOC,
     }
-    if close_ticket is not None:
-        req["position"] = close_ticket  # 지정 포지션 부분청산
-    result = mt5.order_send(req)
-    if result.retcode != mt5.TRADE_RETCODE_DONE:
-        raise RuntimeError(f"order_send failed: {result}")
-    return result
+    res = mt5.order_send(req)
+    if res is None:
+        log(f"[ERR] order_send None: {mt5.last_error()}")
+        return False
+    if res.retcode != mt5.TRADE_RETCODE_DONE:
+        log(f"[ERR] order_send retcode={res.retcode}, {res.comment}")
+        return False
+    log(f"[OK] market {side} {vol} {symbol}")
+    return True
 
-def open_units(symbol: str, side: str, units: int):
-    """3단 분할을 위해 아예 1단위씩 개별 포지션으로 오픈"""
-    ensure_symbol(symbol)
-    for _ in range(units):
-        send_deal(symbol, side, UNIT_LOT)
-    print(f"✅ ENTRY {side.upper()} {symbol} x{units} units (lot {UNIT_LOT} each)")
+def close_partial(symbol: str, side: str, volume: float) -> bool:
+    opp = "short" if side == "long" else "long"
+    return send_market_order(symbol, opp, volume)
 
-def list_positions(symbol: str, side: str) -> List[mt5.TradePosition]:
-    allpos = mt5.positions_get(symbol=symbol)
-    want_type = mt5.POSITION_TYPE_BUY if side == "long" else mt5.POSITION_TYPE_SELL
-    items = [p for p in allpos or [] if p.type == want_type and p.magic == MAGIC]
-    # 오래된 것부터 정렬(먼저 연 포지션부터 청산)
-    items.sort(key=lambda x: x.time) 
-    return items
+def close_all(symbol: str, side_hint: Optional[str] = None) -> bool:
+    s, qty, _ = get_position_summary(symbol)
+    if s == "flat":
+        log("[INFO] no position to close")
+        return True
+    return close_partial(symbol, s, qty)
 
-def close_units(symbol: str, side: str, units: int):
-    """해당 방향 포지션 중 units개(각 0.01 lot) 부분청산"""
-    opp_side = "sell" if side == "long" else "buy"
-    positions = list_positions(symbol, side)
-    if not positions:
-        print("ℹ️ close_units: no positions to close")
-        return 0
-    closed = 0
-    for p in positions:
-        if closed >= units: break
-        # 각 포지션의 볼륨이 UNIT_LOT 이상이라고 가정
-        lot_to_close = min(UNIT_LOT, p.volume)
-        send_deal(symbol, opp_side, lot_to_close, close_ticket=p.ticket)
-        closed += 1
-    print(f"✅ CLOSE {symbol} {side} units={closed}")
-    return closed
+def poll_next_task() -> Optional[dict]:
+    try:
+        r = requests.get(
+            f"{SERVER_URL}/tasks/next",
+            headers={"X-Agent-Token": AGENT_TOKEN},
+            timeout=10,
+        )
+        r.raise_for_status()
+        return r.json().get("task")
+    except Exception as e:
+        log(f"[ERR] poll_next_task: {e}")
+        return None
 
-def close_all(symbol: str):
-    """남아있는 동일 magic 모든 포지션 전량 종료"""
-    pos = mt5.positions_get(symbol=symbol) or []
-    count = 0
-    for p in pos:
-        if p.magic != MAGIC: 
-            continue
-        side = "sell" if p.type == mt5.POSITION_TYPE_BUY else "buy"
-        send_deal(symbol, side, p.volume, close_ticket=p.ticket)
-        count += 1
-    print(f"✅ CLOSE-ALL {symbol} positions={count}")
-    return count
+def ack_task(task_id: int, ok: bool, detail: str = ""):
+    try:
+        r = requests.post(
+            f"{SERVER_URL}/tasks/ack",
+            headers={"X-Agent-Token": AGENT_TOKEN},
+            json={"id": task_id, "ok": ok, "detail": detail},
+            timeout=10,
+        )
+        r.raise_for_status()
+    except Exception as e:
+        log(f"[ERR] ack_task: {e}")
 
-# ======== 신호 파서 ========
-def parse_signal(payload: dict) -> Dict:
-    """
-    payload 예시(TradingView Alert JSON):
-      {
-        "symbol": "EURUSD",
-        "message": "롱진입",   # 또는 "숏진입", "분할1", "분할 2", "분할3", "손절", "롱본절", "기준이평이탈숏종료" 등
-      }
-    """
-    text = (payload.get("message") or payload.get("msg") or payload.get("text") or "").lower()
-    symbol = payload.get("symbol") or payload.get("ticker") or payload.get("sym") or ""
-    symbol = symbol.strip()
-
-    # 진입
-    if any(k in text for k in ["롱진입", "long entry", "long_in", "long open", "buy entry", "go long", "long start"]):
-        return {"action": "entry", "side": "buy", "symbol": symbol}
-    if any(k in text for k in ["숏진입", "short entry", "short_in", "short open", "sell entry", "go short", "short start"]):
-        return {"action": "entry", "side": "sell", "symbol": symbol}
-
-    # 분할 종료 1/2/3
-    if any(k in text for k in ["분할1", "tp1", "1차", "partial1", "분할 1"]):
-        return {"action": "partial", "stage": 1, "symbol": symbol}
-    if any(k in text for k in ["분할2", "tp2", "2차", "partial2", "분할 2"]):
-        return {"action": "partial", "stage": 2, "symbol": symbol}
-    if any(k in text for k in ["분할3", "tp3", "3차", "partial3", "분할 3"]):
-        return {"action": "partial", "stage": 3, "symbol": symbol}
-
-    # 전량 종료(손절/본절/기준이평이탈)
-    if any(k in text for k in ["손절", "stop", "sl", "기준이평이탈숏종료", "기준이평이탈롱종료", "롱본절", "숏본절", "breakeven"]):
-        return {"action": "close_all", "symbol": symbol}
-
-    # 사이드 명시된 본절/손절(있다면 처리 보강 가능)
-    return {"action": "unknown", "symbol": symbol, "raw": payload}
-
-# ======== 실행 루프 ========
-def handle(parsed: Dict):
-    action = parsed.get("action")
-    symbol = parsed.get("symbol")
-    if not symbol:
-        print("⚠️ symbol missing, skip:", parsed); return
-
-    if action == "entry":
-        side = parsed["side"]  # 'buy' or 'sell'
-        # 3계약 고정 → 0.01lot씩 3개 개별 포지션 오픈
-        open_units(symbol, side, ENTRY_UNITS)
-        return
-
-    if action == "partial":
-        stage = parsed.get("stage")
-        # 각 분할은 1계약씩 종료
-        # 어느 방향 포지션인지 알아내서 닫아야 함(롱/숏 모두 지원)
-        # 롱 포지션부터 닫아보고 없으면 숏 포지션 닫기
-        closed = close_units(symbol, "long", 1)
-        if closed == 0:
-            close_units(symbol, "short", 1)
-        print(f"✅ PARTIAL stage={stage} {symbol}")
-        return
-
-    if action == "close_all":
-        close_all(symbol)
-        return
-
-    print("ℹ️ unknown action -> ignore:", parsed)
-
-def poll_once() -> int:
-    url = f"{RENDER_BASE}/pull"
-    res = requests.post(url, json={"agent_key": AGENT_KEY, "max_batch": 10}, headers=AUTH_HEADER, timeout=10)
-    res.raise_for_status()
-    items = res.json().get("items", [])
-    if not items:
-        return 0
-    ok_ids, fail_ids = [], []
-    for it in items:
-        try:
-            payload = it["payload"]
-            parsed = parse_signal(payload)
-            handle(parsed)
-            ok_ids.append(it["id"])
-        except Exception as e:
-            print("❌ handle error:", e)
-            traceback.print_exc()
-            fail_ids.append(it["id"])
-    if ok_ids:
-        requests.post(f"{RENDER_BASE}/ack", json={"agent_key": AGENT_KEY, "ids": ok_ids, "status": "done"}, timeout=10)
-    if fail_ids:
-        requests.post(f"{RENDER_BASE}/ack", json={"agent_key": AGENT_KEY, "ids": fail_ids, "status": "failed"}, timeout=10)
-    return len(items)
-
-def main():
-    print("Starting MT5 Agent…")
+def run_loop():
     init_mt5()
+    log(f"Agent start. server={SERVER_URL}")
+
     while True:
+        task = poll_next_task()
+        if not task:
+            time.sleep(float(os.environ.get("POLL_SEC", "0.8")))
+            continue
+
+        tid = task["id"]
+        cmd = task.get("cmd")
+        tv_symbol = task.get("symbol")
+        mt5_symbol = resolve_symbol(tv_symbol, task.get("mt5_symbol"))
+
+        ok, detail = True, "ok"
         try:
-            n = poll_once()
+            if cmd == "entry":
+                side = task["side"]
+                qty  = float(task["qty"])
+                ok = send_market_order(mt5_symbol, side, qty)
+                detail = f"entry {side} {qty}"
+
+            elif cmd == "partial_exit":
+                frac = float(task["frac"])
+                side_now, qty_now, _ = get_position_summary(mt5_symbol)
+                if side_now == "flat":
+                    ok, detail = True, "no position"
+                else:
+                    close_qty = symbol_round_volume(mt5_symbol, qty_now * frac)
+                    ok = close_partial(mt5_symbol, side_now, close_qty)
+                    detail = f"partial {close_qty} ({frac:.4f})"
+
+            elif cmd == "close_all":
+                ok = close_all(mt5_symbol, task.get("hint_side"))
+                detail = "close_all"
+
+            else:
+                ok, detail = True, f"noop({cmd})"
+
         except Exception as e:
-            print("⚠️ poll error:", e)
-        time.sleep(POLL_INTERVAL)
+            ok, detail = False, f"exception: {e}"
+
+        ack_task(tid, ok, detail)
 
 if __name__ == "__main__":
-    main()
+    run_loop()
