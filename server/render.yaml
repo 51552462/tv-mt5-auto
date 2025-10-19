@@ -2,14 +2,15 @@ services:
   - type: web
     name: tv-mt5-hub
     env: python
-    plan: free
-    buildCommand: pip install -r server/requirements.txt
-    startCommand: uvicorn server.main:app --host 0.0.0.0 --port $PORT
+    # ⬇️ 이 줄이 핵심: 서비스 루트를 /server 로 고정
+    rootDir: server
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     autoDeploy: true
     envVars:
       - key: DB_PATH
         value: /tmp/signals.db
       - key: AUTH_TOKEN
-        sync: false       # TV에서 Authorization 헤더를 보낼 때만 사용(선택)
+        sync: false
       - key: AGENT_KEY
-        sync: false       # 반드시 Render 대시보드에서 값 입력
+        sync: false
