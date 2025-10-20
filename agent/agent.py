@@ -8,7 +8,7 @@ from typing import Optional, Tuple
 import MetaTrader5 as mt5
 
 # ===================== 사용자 설정 =====================
-SERVER_URL   = os.environ.get("SERVER_URL",   "https://<your-render-domain>")
+SERVER_URL   = os.environ.get("SERVER_URL",   "https://tv-mt5-auto.onrender.com")
 AGENT_KEY    = os.environ.get("AGENT_KEY",    "set-me")
 POLL_SEC     = float(os.environ.get("POLL_SEC", "0.8"))
 
@@ -310,3 +310,4 @@ def run_loop():
 
 if __name__ == "__main__":
     run_loop()
+
