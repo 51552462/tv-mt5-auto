@@ -1,313 +1,460 @@
-# /agent/agent.py
+# agent.py
+# -----------------------------
+# TradingView -> (Render 서버) -> MT5 주문 실행 에이전트
+# - Windows + MetaTrader5 파이썬 모듈 필요
+# - 환경변수:
+#     SERVER_URL          : 예) https://tv-mt5-auto.onrender.com
+#     AGENT_KEY           : Render 환경변수와 동일 값
+#     FIXED_ENTRY_LOT     : 기본 진입 랏(예: 0.6, 테스트는 0.01 권장)
+#     TELEGRAM_BOT_TOKEN  : (선택) 텔레그램 봇 토큰
+#     TELEGRAM_CHAT_ID    : (선택) 텔레그램 채팅 ID
+#
+# - 동작 개요:
+#     1) /pull 로 신호를 가져옴 (JSON)
+#     2) 현재 MT5 포지션과 신호 비교 후, 진입/분할/전량/리버스 수행
+#     3) 성공/실패를 /ack 로 서버에 회신
+#     4) 텔레그램으로 이벤트 알림 (선택)
+#
+# - 신호 포맷(예시):
+#   {
+#     "symbol": "NQ1!",          # 또는 NAS100/US100/USTEC 등
+#     "action": "buy"|"sell",     # TV의 order.action
+#     "contracts": 9,             # TV 전략이 보고한 '변동 계약수'
+#     "pos_after": 6,             # 이 시그널 처리 후 포지션 계약수(전략 기준)
+#     "order_price": 25048.00,
+#     "market_position": "long"|"short"|"flat",
+#     "time": "2025-10-19T13:10:00Z"
+#   }
+#
+# - 분할 계산 로직:
+#     before = contracts + pos_after   (TV가 보내는 값으로 역산)
+#     fraction = contracts / before    (청산 또는 감축 비율)
+#     close_lot = opened_lot * fraction
+#
+# - 안전장치:
+#     * 심볼별 min/step에 맞춰 랏 스냅
+#     * order_calc_margin으로 증거금 사전 체크(가능 심볼/랏 자동 선택)
+#     * 텔레그램 알림 (선택)
+#
+# -----------------------------
+
 import os
 import time
 import json
-import requests
-from typing import Optional, Tuple
+import math
+import traceback
+from typing import Optional, Tuple, Dict, Any, List
 
+import requests
+
+# MetaTrader5 모듈은 Windows + 64bit에서만 정상 동작합니다.
+# pip: MetaTrader5==5.0.5370 권장
 import MetaTrader5 as mt5
 
-# ===================== 사용자 설정 =====================
-SERVER_URL   = os.environ.get("SERVER_URL",   "https://tv-mt5-auto.onrender.com")
-AGENT_KEY    = os.environ.get("AGENT_KEY",    "set-me")
-POLL_SEC     = float(os.environ.get("POLL_SEC", "0.8"))
 
-# 고정 진입 수량(랏) – 분할은 비율 환산으로 처리
-FIXED_ENTRY_LOT = float(os.environ.get("FIXED_ENTRY_LOT", "0.6"))
+# ============== 환경변수 로드 ==============
 
-# 브로커 최종 심볼 후보(네 브로커 표기에 맞게 필요하면 추가)
-FINAL_ALIASES = {
-    "NQ1!": ["US100", "NAS100", "US100.cash", "NAS100.cash", "USTEC", "USTECH"]
+SERVER_URL = os.environ.get("SERVER_URL", "").rstrip("/")
+AGENT_KEY = os.environ.get("AGENT_KEY", "")
+FIXED_ENTRY_LOT = float(os.environ.get("FIXED_ENTRY_LOT", "0.01"))
+
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+POLL_INTERVAL_SEC = float(os.environ.get("POLL_INTERVAL_SEC", "1.0"))
+MAX_BATCH = int(os.environ.get("MAX_BATCH", "10"))
+
+# 심볼 별칭 (우선순위: NAS100 -> US100 -> USTEC)
+FINAL_ALIASES: Dict[str, List[str]] = {
+    "NQ1!": ["NAS100", "US100", "USTEC"],
+    "NAS100": ["NAS100", "US100", "USTEC"],
+    "US100": ["US100", "NAS100", "USTEC"],
+    "USTEC": ["USTEC", "US100", "NAS100"],
+    # FX 예시(필요시 확장)
+    "EURUSD": ["EURUSD", "EURUSD.m", "EURUSD.micro", "EURUSD.pro"],
 }
-# =======================================================
 
+
+# ============== 유틸 ==============
 
 def log(msg: str):
     print(time.strftime("[%Y-%m-%d %H:%M:%S]"), msg, flush=True)
 
 
-# --------------- MT5 유틸 ---------------
-def init_mt5():
-    if not mt5.initialize():
-        raise RuntimeError(f"MT5 initialize failed: {mt5.last_error()}")
-    acc = mt5.account_info()
-    if acc is None:
-        raise RuntimeError("MT5 not logged in. Please login in terminal first.")
-    log(f"MT5 ok: {acc.login}, {acc.company}")
-
-def resolve_symbol(tv_symbol: str, server_hint: Optional[str]) -> str:
-    # 1) 서버가 추천한 심볼(있다면) 우선
-    if server_hint:
-        info = mt5.symbol_info(server_hint)
-        if info:
-            if not info.visible:
-                mt5.symbol_select(server_hint, True)
-            return server_hint
-    # 2) 로컬 후보 탐색
-    for tv, candidates in FINAL_ALIASES.items():
-        if tv_symbol.upper() == tv.upper():
-            for c in candidates:
-                info = mt5.symbol_info(c)
-                if info:
-                    if not info.visible:
-                        mt5.symbol_select(c, True)
-                    return c
-    # 3) 실패 시 TV 심볼 그대로(대개 존재하지 않음)
-    return tv_symbol
-
-def symbol_round_volume(symbol: str, vol: float) -> float:
-    info = mt5.symbol_info(symbol)
-    if not info:
-        return round(vol, 2)
-    step = info.volume_step or 0.01
-    vmin = info.volume_min or step
-    vmax = info.volume_max or max(100.0, vol)
-    snapped = round(round(vol/step)*step, 10)
-    if snapped < vmin: snapped = 0.0
-    if snapped > vmax: snapped = vmax
-    return snapped
-
-def get_position_summary(symbol: str) -> Tuple[str, float, float | None]:
-    """
-    returns (side, qty, avg_price)
-    side: 'long'|'short'|'flat'
-    qty : 양수 랏
-    """
-    positions = mt5.positions_get(symbol=symbol)
-    if not positions:
-        return ("flat", 0.0, None)
-
-    long_qty = 0.0
-    short_qty = 0.0
-    long_val = 0.0
-    short_val = 0.0
-
-    for p in positions:
-        if p.type == mt5.POSITION_TYPE_BUY:
-            long_qty  += p.volume
-            long_val  += p.price_open * p.volume
-        elif p.type == mt5.POSITION_TYPE_SELL:
-            short_qty += p.volume
-            short_val += p.price_open * p.volume
-
-    if long_qty > short_qty:
-        avg = (long_val/long_qty) if long_qty > 0 else None
-        return ("long", long_qty - short_qty, avg)
-    elif short_qty > long_qty:
-        avg = (short_val/short_qty) if short_qty > 0 else None
-        return ("short", short_qty - long_qty, avg)
-    else:
-        return ("flat", 0.0, None)
-
-def send_market_order(symbol: str, side: str, volume: float) -> bool:
-    info = mt5.symbol_info(symbol)
-    if not info:
-        log(f"[ERR] symbol_info None: {symbol}")
-        return False
-    if not info.visible:
-        mt5.symbol_select(symbol, True)
-
-    vol = symbol_round_volume(symbol, volume)
-    if vol <= 0:
-        log(f"[SKIP] volume<=0 after rounding: req={volume}")
-        return True
-
-    order_type = mt5.ORDER_TYPE_BUY if side == "long" else mt5.ORDER_TYPE_SELL
-    req = {
-        "action": mt5.TRADE_ACTION_DEAL,
-        "symbol": symbol,
-        "volume": vol,
-        "type": order_type,
-        "deviation": 50,
-        "magic": 20251019,
-        "comment": "tv-mt5-agent",
-        "type_filling": mt5.ORDER_FILLING_IOC,
-    }
-    res = mt5.order_send(req)
-    if res is None:
-        log(f"[ERR] order_send None: {mt5.last_error()}")
-        return False
-    if res.retcode != mt5.TRADE_RETCODE_DONE:
-        log(f"[ERR] order_send retcode={res.retcode}, {res.comment}")
-        return False
-    log(f"[OK] market {side} {vol} {symbol}")
-    return True
-
-def close_partial(symbol: str, side: str, volume: float) -> bool:
-    opp = "short" if side == "long" else "long"
-    return send_market_order(symbol, opp, volume)
-
-def close_all(symbol: str) -> bool:
-    s, qty, _ = get_position_summary(symbol)
-    if s == "flat":
-        log("[INFO] no position to close")
-        return True
-    return close_partial(symbol, s, qty)
-
-
-# --------------- Render 통신 ---------------
-def pull_batch(max_batch: int = 5) -> list[dict]:
-    try:
-        r = requests.post(
-            f"{SERVER_URL}/pull",
-            json={"agent_key": AGENT_KEY, "max_batch": max_batch},
-            timeout=15,
-        )
-        r.raise_for_status()
-        items = r.json().get("items", [])
-        return items
-    except Exception as e:
-        log(f"[ERR] pull: {e}")
-        return []
-
-def ack(ids: list[int], status: str = "done"):
-    if not ids:
+def tg(message: str):
+    """텔레그램 알림(선택). 환경변수에 토큰/챗ID가 있어야 동작."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     try:
-        r = requests.post(
-            f"{SERVER_URL}/ack",
-            json={"agent_key": AGENT_KEY, "ids": ids, "status": status},
-            timeout=15,
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": message},
+            timeout=10,
         )
-        r.raise_for_status()
     except Exception as e:
-        log(f"[ERR] ack: {e}")
+        print("[TG ERR]", e, flush=True)
 
 
-# --------------- TV 메시지 판별 로직 ---------------
-def signed_amount(abs_amount: float, market_position: str) -> float:
-    if market_position == "long":
-        return +abs_amount
-    if market_position == "short":
-        return -abs_amount
-    return 0.0
+def ensure_mt5_initialized() -> bool:
+    """MT5 터미널 연결 초기화 + 상태 출력."""
+    try:
+        if not mt5.initialize():
+            log(f"[ERR] MT5 initialize failed: {mt5.last_error()}")
+            return False
+        acct = mt5.account_info()
+        if not acct:
+            log("[ERR] MT5 account_info None (로그인 안됐거나 연결 문제)")
+            return False
+        log(f"MT5 ok: {acct.login}, {acct.company}")
+        return True
+    except Exception:
+        log("[ERR] MT5 initialize exception:\n" + traceback.format_exc())
+        return False
 
-def handle_tv_payload(tv: dict, symbol_hint: Optional[str]) -> bool:
+
+def post_json(path: str, payload: dict, timeout: float = 10.0) -> dict:
+    url = f"{SERVER_URL}{path}"
+    r = requests.post(url, json=payload, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
+
+
+def get_health() -> dict:
+    try:
+        r = requests.get(f"{SERVER_URL}/health", timeout=5)
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        return {}
+
+
+# ============== 심볼/랏 선택 ==============
+
+def pick_best_symbol_and_lot(requested_symbol: str, base_lot: float) -> Tuple[Optional[str], Optional[float]]:
     """
-    tv = {
-      "symbol": "NQ1!",
-      "action": "buy"|"sell",
-      "contracts": 9,
-      "pos_after": 9,
-      "order_price": 25044.75,
-      "market_position": "short"|"long"|"flat",
-      "time": "2025-10-16T10:47:00Z"
+    requested_symbol 또는 별칭 후보 중에서
+    - MT5에 존재하고
+    - min/step에 맞춰 스냅한 lot로
+    - order_calc_margin이 계좌 자유증거금 내에 들어오는
+    첫 심볼을 선택. 실패 시 (None, None) 반환.
+    """
+    acct = mt5.account_info()
+    free = (acct and acct.margin_free) or 0.0
+
+    # 후보 심볼 만들기
+    cands: List[str] = []
+    if requested_symbol:
+        cands.append(requested_symbol)
+
+    for k, v in FINAL_ALIASES.items():
+        if k.upper() == (requested_symbol or "").upper():
+            cands += v
+            break
+
+    # 중복 제거(대소문자 무시)
+    seen = set()
+    cand_syms = []
+    for s in cands:
+        u = s.upper()
+        if u not in seen:
+            seen.add(u)
+            cand_syms.append(s)
+
+    # 후보 순회
+    for sym in cand_syms:
+        info = mt5.symbol_info(sym)
+        if not info:
+            continue
+        if not info.visible:
+            mt5.symbol_select(sym, True)
+            info = mt5.symbol_info(sym)
+            if not info or not info.visible:
+                continue
+
+        # base_lot을 해당 심볼의 min/step으로 스냅
+        lot = max(info.volume_min, base_lot)
+        step = info.volume_step or 0.01
+        # 스텝 스냅 (반올림이 아닌 "올림/내림" 중 선택 필요시 수정)
+        lot = round(lot / step) * step
+        lot = max(lot, info.volume_min)
+        if info.volume_max and lot > info.volume_max:
+            lot = info.volume_max
+
+        price = info.ask or info.bid
+        if not price:
+            continue
+
+        # 마진 계산(매수/매도 모두 시도)
+        m = mt5.order_calc_margin(mt5.ORDER_TYPE_BUY, sym, lot, price)
+        if m is None:
+            m = mt5.order_calc_margin(mt5.ORDER_TYPE_SELL, sym, lot, price)
+
+        log(f"[lot-pick] sym={sym} min={info.volume_min} step={info.volume_step} "
+            f"try_lot={base_lot} snapped_lot={lot} need_margin={m} free={free}")
+
+        if m is not None and free >= m:
+            return sym, lot
+
+    return None, None
+
+
+# ============== 포지션/주문 헬퍼 ==============
+
+def get_position(symbol: str) -> Tuple[str, float]:
+    """
+    현재 포지션 리턴: (side, volume)
+      side: "flat"|"long"|"short"
+      volume: 현재 총 랏
+    """
+    poss = mt5.positions_get(symbol=symbol)
+    if not poss:
+        return "flat", 0.0
+    vol_long = sum(p.volume for p in poss if p.type == mt5.POSITION_TYPE_BUY)
+    vol_short = sum(p.volume for p in poss if p.type == mt5.POSITION_TYPE_SELL)
+    if vol_long > 0 and vol_short == 0:
+        return "long", vol_long
+    if vol_short > 0 and vol_long == 0:
+        return "short", vol_short
+    # (이론상 동시 보유는 없도록 가정)
+    net = vol_long - vol_short
+    if abs(net) < 1e-9:
+        return "flat", 0.0
+    return ("long" if net > 0 else "short"), abs(net)
+
+
+def send_market_order(symbol: str, side: str, lot: float) -> bool:
+    """시장가 진입: side in {'buy','sell'}"""
+    info = mt5.symbol_info(symbol)
+    if not info or not info.visible:
+        mt5.symbol_select(symbol, True)
+
+    if side == "buy":
+        order_type = mt5.ORDER_TYPE_BUY
+        price = info.ask
+    else:
+        order_type = mt5.ORDER_TYPE_SELL
+        price = info.bid
+
+    request = {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": symbol,
+        "type": order_type,
+        "volume": lot,
+        "price": price,
+        "deviation": 50,  # 슬리피지 허용(필요시 조정)
+        "type_filling": mt5.ORDER_FILLING_IOC,
     }
+    r = mt5.order_send(request)
+    if r and r.retcode == mt5.TRADE_RETCODE_DONE:
+        log(f"[OK] market {side.upper()} {lot} {symbol} at {r.price}")
+        tg(f"✅ ENTRY {side.upper()} {lot} {symbol}")
+        return True
+    else:
+        log(f"[ERR] order_send retcode={getattr(r,'retcode',None)}, {getattr(r,'comment', '')}")
+        tg(f"⛔ ENTRY {side.upper()} {lot} {symbol} FAIL {getattr(r,'retcode',None)}")
+        return False
+
+
+def close_partial(symbol: str, side_now: str, lot_close: float) -> bool:
+    """부분 청산: 현재 포지션 방향 반대 주문"""
+    info = mt5.symbol_info(symbol)
+    if not info or not info.visible:
+        mt5.symbol_select(symbol, True)
+
+    if side_now == "long":
+        order_type = mt5.ORDER_TYPE_SELL
+        price = info.bid
+    else:
+        order_type = mt5.ORDER_TYPE_BUY
+        price = info.ask
+
+    request = {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": symbol,
+        "type": order_type,
+        "volume": lot_close,
+        "price": price,
+        "deviation": 50,
+        "type_filling": mt5.ORDER_FILLING_IOC,
+    }
+    r = mt5.order_send(request)
+    if r and r.retcode == mt5.TRADE_RETCODE_DONE:
+        log(f"[OK] partial close {lot_close} {symbol}")
+        tg(f"🔻 PARTIAL {side_now.upper()} -{lot_close} {symbol}")
+        return True
+    else:
+        log(f"[ERR] partial retcode={getattr(r,'retcode',None)}, {getattr(r,'comment','')}")
+        tg(f"⛔ PARTIAL FAIL {symbol} {getattr(r,'retcode',None)}")
+        return False
+
+
+def close_all(symbol: str) -> bool:
+    """전량 청산: 현재 보유 랏 전량 반대 주문"""
+    side_now, vol = get_position(symbol)
+    if side_now == "flat" or vol <= 0:
+        log("[SKIP] close_all but flat")
+        return True
+
+    ok = close_partial(symbol, side_now, vol)
+    if ok:
+        tg(f"🧹 CLOSE ALL {symbol}")
+    return ok
+
+
+# ============== 신호 처리 ==============
+
+def compute_fraction_for_partial(contracts: float, pos_after: float) -> float:
     """
-    # 필수 필드 체크
-    for k in ("symbol","action","contracts","pos_after","market_position"):
-        if k not in tv:
-            log(f"[WARN] missing field {k} in payload: {tv}")
-            return True  # ack 처리하여 큐 정체 방지(원하면 False 처리)
+    TV가 보내는 'contracts'(변동분)과 'pos_after'(이후 포지션)로
+    before = contracts + pos_after 로 역산 → fraction = contracts / before
+    예) 9 -> 6, contracts=3, pos_after=6 => fraction=3/9=0.333..
+    """
+    before = contracts + pos_after
+    if before <= 0:
+        return 1.0
+    return max(0.0, min(1.0, float(contracts) / float(before)))
 
-    tv_symbol  = str(tv["symbol"])
-    action     = str(tv["action"]).lower()          # buy/sell
-    contracts  = float(tv["contracts"])
-    pos_after  = float(tv["pos_after"])
-    mpos       = str(tv["market_position"]).lower() # long/short/flat
-    order_px   = float(tv["order_price"]) if "order_price" in tv and tv["order_price"] is not None else None
 
-    dir_ = +1 if action == "buy" else -1
-    signed_after  = signed_amount(pos_after, mpos)
-    signed_before = signed_after - dir_ * contracts
+def handle_signal(sig: dict) -> bool:
+    """
+    단일 신호 처리. True면 성공, False면 실패(재시도 가능).
+    """
+    symbol_req = (sig.get("symbol") or "").strip()
+    action = (sig.get("action") or "").strip().lower()  # 'buy' or 'sell'
+    contracts = float(sig.get("contracts") or 0)
+    pos_after = float(sig.get("pos_after") or 0)
+    market_position = (sig.get("market_position") or "").strip().lower()  # 'long'|'short'|'flat'
+    # order_price, time 등은 로깅용
 
-    mt5_symbol = resolve_symbol(tv_symbol, symbol_hint)
-    side_now, qty_now, avg_price = get_position_summary(mt5_symbol)
+    # 1) 계좌/심볼/랏 결정
+    mt5_symbol, lot_base = pick_best_symbol_and_lot(symbol_req, FIXED_ENTRY_LOT)
+    if not mt5_symbol:
+        log(f"[ERR] tradable symbol not found for req={symbol_req} lot={FIXED_ENTRY_LOT}")
+        return False
 
-    def same_sign(a: float, b: float) -> bool:
-        return (a > 0 and b > 0) or (a < 0 and b < 0)
+    # 2) 현재 포지션 조회
+    side_now, vol_now = get_position(mt5_symbol)
+    log(f"[state] {mt5_symbol}: now={side_now} {vol_now}lot, action={action}, market_pos={market_position}, pos_after={pos_after}, contracts={contracts}")
 
-    # 1) 리버스: 부호 반전(전량 청산 + 반대 방향 새 진입)
-    if abs(signed_before) > 1e-9 and not same_sign(signed_before, signed_after):
-        if side_now != "flat":
-            close_all(mt5_symbol)
-        new_side = "long" if signed_after > 0 else "short"
-        return send_market_order(mt5_symbol, new_side, FIXED_ENTRY_LOT)
+    # 3) 케이스 분기
+    if side_now == "flat":
+        # 진입
+        desired = "buy" if action == "buy" else "sell"
+        return send_market_order(mt5_symbol, desired, lot_base)
 
-    # 2) 새 진입: before == 0
-    if abs(signed_before) < 1e-9:
-        desired = "long" if dir_ == +1 else "short"
-        # 반대 보유 시 정리
-        if side_now == "long" and desired == "short":
-            close_all(mt5_symbol)
-        elif side_now == "short" and desired == "long":
-            close_all(mt5_symbol)
-        return send_market_order(mt5_symbol, desired, FIXED_ENTRY_LOT)
-
-    # 3) 같은 방향 증액 → 무시(정책)
-    if same_sign(signed_before, signed_after) and abs(signed_after) > abs(signed_before):
-        log("[INFO] pyramiding signal ignored")
-        return True
-
-    # 4) 부분 청산(분할): 같은 방향, 크기 감소
-    if same_sign(signed_before, signed_after) and abs(signed_after) < abs(signed_before):
-        if side_now == "flat":
-            log("[INFO] local flat; skip partial")
+    # 현재 LONG인데 'sell'이 왔다 -> 부분청산/전량/리버스
+    if side_now == "long" and action == "sell":
+        # 전량 종료 or 리버스 판단
+        if market_position in ("flat", "short") or pos_after == 0:
+            ok = close_all(mt5_symbol)
+            if not ok:
+                return False
+            # 리버스(시장포지션 short)면 새로 진입
+            if market_position == "short" and pos_after > 0:
+                return send_market_order(mt5_symbol, "sell", lot_base)
             return True
-        frac = (abs(signed_before) - abs(signed_after)) / max(abs(signed_before), 1e-9)
-        close_qty = symbol_round_volume(mt5_symbol, qty_now * frac)
-        if close_qty > 0:
-            return close_partial(mt5_symbol, side_now, close_qty)
-        log("[INFO] calc close_qty <= 0; skip")
-        return True
+        # 부분청산
+        frac = compute_fraction_for_partial(contracts, pos_after)
+        lot_close = max(0.0, round(lot_base * frac, 2))
+        lot_close = min(lot_close, vol_now)  # 보유 초과 방지
+        if lot_close <= 0:
+            log("[SKIP] computed lot_close <= 0")
+            return True
+        return close_partial(mt5_symbol, side_now, lot_close)
 
-    # 5) 전량 청산: after == 0
-    if abs(signed_after) < 1e-9 and abs(signed_before) > 0:
-        if side_now != "flat":
-            return close_all(mt5_symbol)
-        return True
+    # 현재 SHORT인데 'buy'가 왔다 -> 부분청산/전량/리버스
+    if side_now == "short" and action == "buy":
+        if market_position in ("flat", "long") or pos_after == 0:
+            ok = close_all(mt5_symbol)
+            if not ok:
+                return False
+            if market_position == "long" and pos_after > 0:
+                return send_market_order(mt5_symbol, "buy", lot_base)
+            return True
+        # 부분청산
+        frac = compute_fraction_for_partial(contracts, pos_after)
+        lot_close = max(0.0, round(lot_base * frac, 2))
+        lot_close = min(lot_close, vol_now)
+        if lot_close <= 0:
+            log("[SKIP] computed lot_close <= 0")
+            return True
+        return close_partial(mt5_symbol, side_now, lot_close)
 
-    log("[INFO] noop")
+    # 그 외(예: 같은 방향 신호) -> 보수적으로 무시
+    log("[SKIP] same-direction or unsupported signal; no action taken")
     return True
 
 
-# --------------- 메인 루프 ---------------
-def run_loop():
-    init_mt5()
+# ============== 폴링 루프 ==============
+
+def poll_loop():
     log(f"Agent start. server={SERVER_URL}")
+    tg("🤖 MT5 Agent started")
 
     while True:
-        batch = pull_batch(max_batch=5)
-        if not batch:
-            time.sleep(POLL_SEC)
-            continue
+        try:
+            payload = {"agent_key": AGENT_KEY, "max_batch": MAX_BATCH}
+            res = post_json("/pull", payload)
+            items = res.get("items") or []
 
-        ok_ids, fail_ids = [], []
+            if not items:
+                time.sleep(POLL_INTERVAL_SEC)
+                continue
 
-        for item in batch:
-            tid  = item["id"]
-            data = item.get("payload") or {}
-            # 서버에서 심볼 힌트를 넣어줄 수도 있으므로 같이 받음
-            mt5_hint = data.get("mt5_symbol") if isinstance(data.get("mt5_symbol"), str) else None
+            ack_ids = []
+            for it in items:
+                item_id = it.get("id")
+                sig = it.get("message") or {}
+                ok = False
+                try:
+                    ok = handle_signal(sig)
+                except Exception:
+                    log("[ERR] handle_signal exception:\n" + traceback.format_exc())
+                    ok = False
+                if ok:
+                    ack_ids.append(item_id)
 
-            try:
-                # TradingView 원문(JSON)일 수도 있고, 문자열일 수도 있어 안전하게 처리
-                payload = data
-                if isinstance(data, str):
-                    try:
-                        payload = json.loads(data)
-                    except Exception:
-                        payload = {"raw": data}
+            if ack_ids:
+                try:
+                    post_json("/ack", {"agent_key": AGENT_KEY, "ids": ack_ids})
+                except Exception:
+                    log("[ERR] ack failed:\n" + traceback.format_exc())
 
-                # TV 포맷일 때만 처리
-                if all(k in payload for k in ("symbol","action","contracts","pos_after","market_position")):
-                    ok = handle_tv_payload(payload, mt5_hint)
-                else:
-                    # 그 외 포맷은 패스(혹은 필요 시 별도 처리)
-                    log(f"[INFO] skip unsupported payload: {payload}")
-                    ok = True
+            # 짧은 휴식
+            time.sleep(0.2)
 
-                (ok_ids if ok else fail_ids).append(tid)
-            except Exception as e:
-                log(f"[ERR] task {tid} exception: {e}")
-                fail_ids.append(tid)
+        except requests.HTTPError as e:
+            status = getattr(e.response, "status_code", None)
+            if status == 401:
+                log("[ERR] poll: 401 Unauthorized (AGENT_KEY 불일치 가능)")
+            else:
+                log(f"[ERR] poll HTTP {status}: {e}")
+            time.sleep(2.0)
 
-        if ok_ids:
-            ack(ok_ids, status="done")
-        if fail_ids:
-            ack(fail_ids, status="failed")
+        except Exception as e:
+            log("[ERR] poll exception: " + str(e))
+            time.sleep(2.0)
+
+
+# ============== 메인 ==============
+
+def main():
+    # 사전 점검
+    if not SERVER_URL or not AGENT_KEY:
+        log("[FATAL] SERVER_URL/AGENT_KEY 환경변수를 설정하세요.")
+        return
+
+    if not ensure_mt5_initialized():
+        return
+
+    # 건강상태 로그
+    h = get_health()
+    if h:
+        log(f"health: {h}")
+
+    # 루프 시작
+    poll_loop()
 
 
 if __name__ == "__main__":
-    run_loop()
-
+    main()
