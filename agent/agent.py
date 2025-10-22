@@ -48,7 +48,7 @@ import MetaTrader5 as mt5
 
 SERVER_URL = os.environ.get("SERVER_URL", "").rstrip("/")
 AGENT_KEY = os.environ.get("AGENT_KEY", "")
-FIXED_ENTRY_LOT = float(os.environ.get("FIXED_ENTRY_LOT", "0.3"))
+FIXED_ENTRY_LOT = float(os.environ.get("FIXED_ENTRY_LOT", "0.1"))
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
@@ -121,39 +121,52 @@ def get_health() -> dict:
 
 
 # ============== 심볼/랏 선택 ==============
+# ★ 변경: 대소문자 무시 + 부분일치(예: nas100.cash)까지 실제 심볼명을 찾아 사용
 
 def pick_best_symbol_and_lot(requested_symbol: str, base_lot: float) -> Tuple[Optional[str], Optional[float]]:
     """
-    requested_symbol 또는 별칭 후보 중에서
-    - MT5에 존재하고
-    - min/step에 맞춰 스냅한 lot로
-    - order_calc_margin이 계좌 자유증거금 내에 들어오는
-    첫 심볼을 선택. 실패 시 (None, None) 반환.
+    요청 심볼을 계정의 실제 심볼명으로 해석(대소문자 무시, 부분일치 허용)한 뒤,
+    min/step 스냅, 증거금 체크를 통과하는 첫 후보를 반환.
     """
+    if not requested_symbol:
+        return None, None
+
+    req = requested_symbol.strip()
+    req_l = req.lower()
+
+    # 1) 모든 심볼 목록 확보
+    all_syms = mt5.symbols_get()
+    cand_names: List[str] = []
+
+    # 2) 완전 대소문자 무시 동일매치
+    for s in all_syms:
+        if s.name.lower() == req_l:
+            cand_names.append(s.name)
+    # 3) 부분일치(예: nas100.cash, us100_m 등)
+    if not cand_names:
+        for s in all_syms:
+            name_l = s.name.lower()
+            if req_l in name_l:
+                cand_names.append(s.name)
+
+    # 최종 후보 없으면 별칭도 시도
+    if not cand_names:
+        alias_pool = FINAL_ALIASES.get(req.upper(), [])
+        for a in alias_pool:
+            a_l = a.lower()
+            for s in all_syms:
+                if s.name.lower() == a_l or a_l in s.name.lower():
+                    cand_names.append(s.name)
+
+    # 중복 제거, 순서 유지
+    seen = set()
+    cand_names = [x for x in cand_names if not (x in seen or seen.add(x))]
+
+    # 증거금/스냅 체크
     acct = mt5.account_info()
     free = (acct and acct.margin_free) or 0.0
 
-    # 후보 심볼 만들기
-    cands: List[str] = []
-    if requested_symbol:
-        cands.append(requested_symbol)
-
-    for k, v in FINAL_ALIASES.items():
-        if k.upper() == (requested_symbol or "").upper():
-            cands += v
-            break
-
-    # 중복 제거(대소문자 무시)
-    seen = set()
-    cand_syms = []
-    for s in cands:
-        u = s.upper()
-        if u not in seen:
-            seen.add(u)
-            cand_syms.append(s)
-
-    # 후보 순회
-    for sym in cand_syms:
+    for sym in cand_names:
         info = mt5.symbol_info(sym)
         if not info:
             continue
@@ -175,7 +188,6 @@ def pick_best_symbol_and_lot(requested_symbol: str, base_lot: float) -> Tuple[Op
         if not price:
             continue
 
-        # 마진 계산(매수/매도 모두 시도)
         m = mt5.order_calc_margin(mt5.ORDER_TYPE_BUY, sym, lot, price)
         if m is None:
             m = mt5.order_calc_margin(mt5.ORDER_TYPE_SELL, sym, lot, price)
@@ -245,7 +257,7 @@ def send_market_order(symbol: str, side: str, lot: float) -> bool:
         return False
 
 
-# ========= (중요 수정) 헤지 계정용: position 티켓 지정해 부분/전량 청산 =========
+# ========= 헤지 계정용: position 티켓 지정해 부분/전량 청산 =========
 
 def _close_volume_by_tickets(symbol: str, side_now: str, vol_to_close: float) -> bool:
     """
@@ -341,7 +353,7 @@ def close_all(symbol: str) -> bool:
     return ok
 
 
-# ============== (추가) 스텝 내림 반올림 ==============
+# ============== (보조) 스텝 내림 반올림 ==============
 
 def round_down_to_step(x: float, step: float) -> float:
     """step 단위로 내림."""
@@ -364,52 +376,46 @@ def compute_fraction_for_partial(contracts: float, pos_after: float) -> float:
     return max(0.0, min(1.0, float(contracts) / float(before)))
 
 
+# ★ 변경: 종료 의도면 무조건 '진입 금지' + 보유 시 전량 청산
 def handle_signal(sig: dict) -> bool:
     """
     단일 신호 처리. True면 성공, False면 실패(재시도 가능).
     """
     symbol_req = (sig.get("symbol") or "").strip()
-    action = (sig.get("action") or "").strip().lower()          # 'buy' or 'sell'
+    action = (sig.get("action") or "").strip().lower()
     contracts = float(sig.get("contracts") or 0)
     pos_after = float(sig.get("pos_after") or 0)
-    market_position = (sig.get("market_position") or "").strip().lower()  # 'long'|'short'|'flat'
+    market_position = (sig.get("market_position") or "").strip().lower()
 
-    # 1) tradable 심볼/기본 랏 결정
+    # 1) tradable 심볼/기본 랏
     mt5_symbol, lot_base = pick_best_symbol_and_lot(symbol_req, FIXED_ENTRY_LOT)
     if not mt5_symbol:
         log(f"[ERR] tradable symbol not found for req={symbol_req} lot={FIXED_ENTRY_LOT}")
         return False
 
-    # 2) 현재 포지션 조회
+    # 2) 현재 포지션
     side_now, vol_now = get_position(mt5_symbol)
     log(f"[state] {mt5_symbol}: now={side_now} {vol_now}lot, action={action}, "
         f"market_pos={market_position}, pos_after={pos_after}, contracts={contracts}")
 
-    # 3) '종료 전용' 시그널 판정
+    # 3) 종료 의도 판정 (손절/전량 종료 신호)
     exit_intent = (market_position == "flat") or (pos_after == 0)
 
-    # 플랫인데 종료 의도면 신규 진입 금지
-    if side_now == "flat" and exit_intent:
-        log("[SKIP] exit-intent while flat -> ignore (no new entry)")
-        return True
+    # ★★ 종료 의도는 '항상' 진입을 금지하고, 보유 중이면 닫고, 없으면 무시 ★★
+    if exit_intent:
+        if side_now == "flat" or vol_now <= 0:
+            log("[SKIP] exit-intent while flat -> ignore")
+            return True
+        # 보유 중이면 전량 종료
+        return close_all(mt5_symbol)
 
-    # --- 진입 ---
+    # ---- 아래부터는 '진입/분할' 로직 ----
     if side_now == "flat":
         desired = "buy" if action == "buy" else "sell"
         return send_market_order(mt5_symbol, desired, lot_base)
 
-    # --- LONG 보유 + sell 신호 ---
     if side_now == "long" and action == "sell":
-        # 전량/손절/리버스
-        if exit_intent or market_position in ("flat", "short"):
-            ok = close_all(mt5_symbol)
-            if not ok:
-                return False
-            if market_position == "short" and pos_after > 0:
-                return send_market_order(mt5_symbol, "sell", lot_base)
-            return True
-
-        # 부분 청산 (현재 보유량 기준, step 내림)
+        # 부분 청산
         info = mt5.symbol_info(mt5_symbol)
         step = (info and info.volume_step) or 0.01
         frac = compute_fraction_for_partial(contracts, pos_after)
@@ -420,16 +426,7 @@ def handle_signal(sig: dict) -> bool:
             return True
         return close_partial(mt5_symbol, side_now, lot_close)
 
-    # --- SHORT 보유 + buy 신호 ---
     if side_now == "short" and action == "buy":
-        if exit_intent or market_position in ("flat", "long"):
-            ok = close_all(mt5_symbol)
-            if not ok:
-                return False
-            if market_position == "long" and pos_after > 0:
-                return send_market_order(mt5_symbol, "buy", lot_base)
-            return True
-
         info = mt5.symbol_info(mt5_symbol)
         step = (info and info.volume_step) or 0.01
         frac = compute_fraction_for_partial(contracts, pos_after)
@@ -440,7 +437,6 @@ def handle_signal(sig: dict) -> bool:
             return True
         return close_partial(mt5_symbol, side_now, lot_close)
 
-    # --- 나머지 ---
     log("[SKIP] same-direction or unsupported signal; no action taken")
     return True
 
