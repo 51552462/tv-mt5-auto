@@ -245,47 +245,97 @@ def send_market_order(symbol: str, side: str, lot: float) -> bool:
         return False
 
 
-def close_partial(symbol: str, side_now: str, lot_close: float) -> bool:
-    """부분 청산: 현재 포지션 방향 반대 주문"""
+# ========= (중요 수정) 헤지 계정용: position 티켓 지정해 부분/전량 청산 =========
+
+def _close_volume_by_tickets(symbol: str, side_now: str, vol_to_close: float) -> bool:
+    """
+    헤지 계정: 보유 포지션(여러 티켓 가능)을 순서대로 지정하여
+    원하는 수량(vol_to_close)만큼 '반대 주문 + position=티켓' 으로 청산.
+    """
+    if vol_to_close <= 0:
+        return True
+
+    # 청산해야 할 쪽 포지션 목록 수집 (롱 보유면 BUY 타입만, 숏 보유면 SELL 타입만)
+    target_type = mt5.POSITION_TYPE_BUY if side_now == "long" else mt5.POSITION_TYPE_SELL
+    poss = [p for p in (mt5.positions_get(symbol=symbol) or []) if p.type == target_type]
+    if not poss:
+        log("[WARN] no positions to close found; skip")
+        return True
+
     info = mt5.symbol_info(symbol)
     if not info or not info.visible:
         mt5.symbol_select(symbol, True)
+        info = mt5.symbol_info(symbol)
 
-    if side_now == "long":
-        order_type = mt5.ORDER_TYPE_SELL
-        price = info.bid
-    else:
-        order_type = mt5.ORDER_TYPE_BUY
-        price = info.ask
+    step = (info and info.volume_step) or 0.01
+    price = (info.bid if side_now == "long" else info.ask)
 
-    request = {
-        "action": mt5.TRADE_ACTION_DEAL,
-        "symbol": symbol,
-        "type": order_type,
-        "volume": lot_close,
-        "price": price,
-        "deviation": 50,
-        "type_filling": mt5.ORDER_FILLING_IOC,
-    }
-    r = mt5.order_send(request)
-    if r and r.retcode == mt5.TRADE_RETCODE_DONE:
-        log(f"[OK] partial close {lot_close} {symbol}")
-        tg(f"🔻 PARTIAL {side_now.upper()} -{lot_close} {symbol}")
+    # 포지션별로 필요한 만큼 나눠서 닫기
+    remain = vol_to_close
+    ok_all = True
+
+    for p in poss:
+        if remain <= 0:
+            break
+
+        close_qty = min(p.volume, remain)
+        # step에 맞춰 내림
+        close_qty = math.floor(close_qty / step) * step
+        if close_qty <= 0:
+            continue
+
+        req = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": symbol,
+            "type": (mt5.ORDER_TYPE_SELL if side_now == "long" else mt5.ORDER_TYPE_BUY),
+            "position": p.ticket,     # ★ 헤지: 반드시 티켓 지정
+            "volume": close_qty,
+            "price": price,
+            "deviation": 50,
+            "type_filling": mt5.ORDER_FILLING_IOC,
+        }
+        r = mt5.order_send(req)
+        if r and r.retcode == mt5.TRADE_RETCODE_DONE:
+            log(f"[OK] close ticket={p.ticket} {close_qty} {symbol}")
+            remain = round(remain - close_qty, 10)
+        else:
+            ok_all = False
+            log(f"[ERR] close ticket={p.ticket} retcode={getattr(r,'retcode',None)} {getattr(r,'comment','')}")
+            # 실패해도 나머지 티켓 계속 시도
+
+    if remain > 0:
+        log(f"[WARN] remained close qty={remain} not closed")
+        ok_all = False
+
+    return ok_all
+
+
+def close_partial(symbol: str, side_now: str, lot_close: float) -> bool:
+    """
+    부분 청산 (헤지 계정 호환): position 티켓을 지정해 필요한 수량만큼 닫는다.
+    """
+    if lot_close <= 0:
+        log("[SKIP] close_partial non-positive")
         return True
+
+    ok = _close_volume_by_tickets(symbol, side_now, lot_close)
+    if ok:
+        tg(f"🔻 PARTIAL {side_now.upper()} -{lot_close} {symbol}")
     else:
-        log(f"[ERR] partial retcode={getattr(r,'retcode',None)}, {getattr(r,'comment','')}")
-        tg(f"⛔ PARTIAL FAIL {symbol} {getattr(r,'retcode',None)}")
-        return False
+        tg(f"⛔ PARTIAL FAIL {symbol}")
+    return ok
 
 
 def close_all(symbol: str) -> bool:
-    """전량 청산: 현재 보유 랏 전량 반대 주문"""
+    """
+    전량 청산 (헤지 계정 호환): 해당 심볼의 모든 포지션을 티켓 지정으로 닫는다.
+    """
     side_now, vol = get_position(symbol)
     if side_now == "flat" or vol <= 0:
         log("[SKIP] close_all but flat")
         return True
 
-    ok = close_partial(symbol, side_now, vol)
+    ok = _close_volume_by_tickets(symbol, side_now, vol)
     if ok:
         tg(f"🧹 CLOSE ALL {symbol}")
     return ok
@@ -314,7 +364,6 @@ def compute_fraction_for_partial(contracts: float, pos_after: float) -> float:
     return max(0.0, min(1.0, float(contracts) / float(before)))
 
 
-# -------- handle_signal 수정본 --------
 def handle_signal(sig: dict) -> bool:
     """
     단일 신호 처리. True면 성공, False면 실패(재시도 가능).
@@ -336,45 +385,42 @@ def handle_signal(sig: dict) -> bool:
     log(f"[state] {mt5_symbol}: now={side_now} {vol_now}lot, action={action}, "
         f"market_pos={market_position}, pos_after={pos_after}, contracts={contracts}")
 
-    # 3) '종료 전용(intent exit-only)' 시그널 식별
-    #    - TV 메시지가 'flat' 또는 pos_after==0 이면 "종료 의도"로 간주
+    # 3) '종료 전용' 시그널 판정
     exit_intent = (market_position == "flat") or (pos_after == 0)
 
-    # 3-1) 현재 플랫인데 종료 의도 시그널이 오면 '절대 진입 금지'
+    # 플랫인데 종료 의도면 신규 진입 금지
     if side_now == "flat" and exit_intent:
         log("[SKIP] exit-intent while flat -> ignore (no new entry)")
         return True
 
-    # 4) 분기
     # --- 진입 ---
     if side_now == "flat":
         desired = "buy" if action == "buy" else "sell"
         return send_market_order(mt5_symbol, desired, lot_base)
 
-    # --- 보유가 LONG 인데 'sell'이 왔다 ---
+    # --- LONG 보유 + sell 신호 ---
     if side_now == "long" and action == "sell":
-        # 전량/손절/리버스 케이스
+        # 전량/손절/리버스
         if exit_intent or market_position in ("flat", "short"):
             ok = close_all(mt5_symbol)
             if not ok:
                 return False
-            # '리버스' 명시(시장포지션 short & pos_after>0)라면 새 숏 진입
             if market_position == "short" and pos_after > 0:
                 return send_market_order(mt5_symbol, "sell", lot_base)
             return True
 
-        # 부분 청산: '현재 보유량' * 비율 → step '내림'으로 계산
+        # 부분 청산 (현재 보유량 기준, step 내림)
         info = mt5.symbol_info(mt5_symbol)
         step = (info and info.volume_step) or 0.01
         frac = compute_fraction_for_partial(contracts, pos_after)
         lot_close = round_down_to_step(vol_now * frac, step)
-        lot_close = min(max(lot_close, step), vol_now)  # 최소 1스텝, 보유 초과 금지
+        lot_close = min(max(lot_close, step), vol_now)
         if lot_close <= 0:
             log("[INFO] calc close_qty <= 0 -> skip")
             return True
         return close_partial(mt5_symbol, side_now, lot_close)
 
-    # --- 보유가 SHORT 인데 'buy'가 왔다 ---
+    # --- SHORT 보유 + buy 신호 ---
     if side_now == "short" and action == "buy":
         if exit_intent or market_position in ("flat", "long"):
             ok = close_all(mt5_symbol)
@@ -394,10 +440,9 @@ def handle_signal(sig: dict) -> bool:
             return True
         return close_partial(mt5_symbol, side_now, lot_close)
 
-    # --- 나머지(같은 방향 추가 신호 등) ---
+    # --- 나머지 ---
     log("[SKIP] same-direction or unsupported signal; no action taken")
     return True
-# -------- handle_signal 수정 끝 --------
 
 
 # ============== 폴링 루프 ==============
@@ -435,7 +480,6 @@ def poll_loop():
                 except Exception:
                     log("[ERR] ack failed:\n" + traceback.format_exc())
 
-            # 짧은 휴식
             time.sleep(0.2)
 
         except requests.HTTPError as e:
