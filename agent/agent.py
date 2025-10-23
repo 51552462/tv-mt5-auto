@@ -3,8 +3,9 @@
 # TradingView → Render 서버 → MT5 자동매매 에이전트
 # - 종료(손절/전량) 신호에서 신규 진입 금지(티켓 지정 DEAL + CLOSE_BY)
 # - /pull 응답이 signal 또는 payload(또는 항목 자체)여도 파싱
-# - 심볼 누락/이상 시 NAS100 계열(US100/USTEC) 자동 탐색하여 진입 가능
-# - exit 판정: market_position=="flat" 또는 action in EXIT_ACTIONS 만 종료로 간주
+# - 심볼 누락 시 NAS100 계열(US100/USTEC) 자동 탐색
+# - FIXED_ENTRY_LOT는 스텝에 '올림(ceil)'으로 맞춰 최소 지정 랏을 보장
+# - 마진 부족 시 스텝 단위로 낮춰 가능한 최대 랏으로 진입
 # --------------------------------------------------------------------
 
 import os
@@ -21,7 +22,7 @@ import MetaTrader5 as mt5
 # ============== 환경변수 ==============
 SERVER_URL = os.environ.get("SERVER_URL", "").rstrip("/")
 AGENT_KEY = os.environ.get("AGENT_KEY", "")
-FIXED_ENTRY_LOT = float(os.environ.get("FIXED_ENTRY_LOT", "0.1"))
+FIXED_ENTRY_LOT = float(os.environ.get("FIXED_ENTRY_LOT", "0.01"))
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
@@ -131,7 +132,7 @@ def detect_open_symbol_from_candidates(candidates: List[str]) -> Optional[str]:
 
 
 def detect_any_open_from_alias_pool() -> Optional[str]:
-    """심볼 누락시 NAS100 계열에서 열려있는 심볼 자동 탐색."""
+    """심볼 누락 시 NAS100 계열에서 열려있는 심볼 자동 탐색."""
     for base in ["NAS100", "US100", "USTEC"]:
         cands = build_candidate_symbols(base)
         sym = detect_open_symbol_from_candidates(cands)
@@ -140,8 +141,26 @@ def detect_any_open_from_alias_pool() -> Optional[str]:
     return None
 
 
+# ============== 보조 ==============
+def ceil_to_step(x: float, step: float) -> float:
+    if step <= 0:
+        return x
+    return math.ceil(x / step) * step
+
+
+def floor_to_step(x: float, step: float) -> float:
+    if step <= 0:
+        return x
+    return math.floor(x / step) * step
+
+
+# ============== 랏 결정 ==============
 def pick_best_symbol_and_lot(requested_symbol: str, base_lot: float) -> Tuple[Optional[str], Optional[float]]:
-    """진입 상황에서만: 요청 심볼/부분일치/별칭 후보 중 진입 가능한 심볼과 랏 선택."""
+    """
+    진입 상황:
+      - base_lot 이상이 되도록 step에 '올림' 맞춤
+      - 마진 부족이면 step 단위로 줄여가며 가능한 최대 랏 선택(최소 volume_min)
+    """
     if not requested_symbol:
         return None, None
     req = requested_symbol.strip()
@@ -180,24 +199,32 @@ def pick_best_symbol_and_lot(requested_symbol: str, base_lot: float) -> Tuple[Op
             if not info or not info.visible:
                 continue
 
-        lot = max(info.volume_min, base_lot)
         step = info.volume_step or 0.01
-        lot = round(lot / step) * step
-        lot = max(lot, info.volume_min)
-        if info.volume_max and lot > info.volume_max:
-            lot = info.volume_max
+        vol_min = info.volume_min or step
 
+        # 1) 사용자가 지정한 값 이상으로 올림하여 맞춤
+        desired = max(vol_min, base_lot)
+        lot = ceil_to_step(desired, step)
+
+        # 2) 마진 체크, 부족하면 step 단위로 감소
         price = info.ask or info.bid
         if not price:
             continue
 
-        m = mt5.order_calc_margin(mt5.ORDER_TYPE_BUY, sym, lot, price)
-        if m is None:
-            m = mt5.order_calc_margin(mt5.ORDER_TYPE_SELL, sym, lot, price)
+        def enough(qty: float) -> bool:
+            m = mt5.order_calc_margin(mt5.ORDER_TYPE_BUY, sym, qty, price)
+            if m is None:
+                m = mt5.order_calc_margin(mt5.ORDER_TYPE_SELL, sym, qty, price)
+            return (m is not None) and (free >= m)
 
-        log(f"[lot-pick] sym={sym} need_margin={m} free={free}")
-        if m is not None and free >= m:
-            return sym, lot
+        # step 내림 루프(최소 vol_min 이상)
+        test_lot = lot
+        while test_lot >= vol_min and not enough(test_lot):
+            test_lot = round(floor_to_step(test_lot - step, step), 10)
+
+        if test_lot >= vol_min and enough(test_lot):
+            log(f"[lot-pick] sym={sym} step={step} min={vol_min} base={base_lot} -> lot={test_lot}")
+            return sym, test_lot
 
     return None, None
 
@@ -271,7 +298,7 @@ def close_by_opposites_if_any(symbol: str) -> bool:
             if qty <= 0:
                 continue
             req = {
-                "action": mt5.TRADE_ACTION_CLOSE_BY,  # ← 여기 따옴표 오류 수정 완료
+                "action": mt5.TRADE_ACTION_CLOSE_BY,
                 "symbol": symbol,
                 "position": b.ticket,
                 "position_by": s.ticket,
@@ -374,25 +401,10 @@ def close_all_for_candidates(candidates: List[str]) -> bool:
     return True if anything or True else True
 
 
-# ============== 보조 ==============
-def round_down_to_step(x: float, step: float) -> float:
-    if step <= 0:
-        return x
-    return math.floor(x / step) * step
-
-
-def compute_fraction_for_partial(contracts: float, pos_after: float) -> float:
-    before = (contracts or 0.0) + (pos_after or 0.0)
-    if before <= 0:
-        return 1.0
-    return max(0.0, min(1.0, float(contracts or 0.0) / float(before)))
-
-
 # ============== 시그널 처리 ==============
 EXIT_ACTIONS = {"close", "exit", "flat", "stop", "sl", "tp", "close_all"}
 
 def _read_symbol_from_signal(sig: dict) -> str:
-    # 다양한 키 허용 (혹시 다른 키로 들어와도 대응)
     for k in ["symbol", "sym", "ticker", "SYMBOL", "Symbol", "s"]:
         v = sig.get(k)
         if v:
@@ -402,7 +414,7 @@ def _read_symbol_from_signal(sig: dict) -> str:
 
 def handle_signal(sig: dict) -> bool:
     # 입력 파싱
-    symbol_req = _read_symbol_from_signal(sig)  # ← 심볼이 없으면 "" 반환
+    symbol_req = _read_symbol_from_signal(sig)
     action = str(sig.get("action", "")).strip().lower()
     contracts = sig.get("contracts", None)
     try:
@@ -425,10 +437,12 @@ def handle_signal(sig: dict) -> bool:
         mt5_symbol = open_sym
         info = mt5.symbol_info(mt5_symbol)
         step = (info and info.volume_step) or 0.01
-        lot_base = max((info and info.volume_min) or FIXED_ENTRY_LOT, FIXED_ENTRY_LOT)
-        lot_base = round(lot_base / step) * step
+        vol_min = (info and info.volume_min) or step
+        # 사용자가 설정한 값 이상으로 올림
+        desired = max(vol_min, FIXED_ENTRY_LOT)
+        lot_base = ceil_to_step(desired, step)
+        log(f"[lot-base] resolved={mt5_symbol} step={step} min={vol_min} FIXED={FIXED_ENTRY_LOT} -> {lot_base}")
     else:
-        # 진입 신규 심볼 선택(심볼 미전달 시 NAS100 계열에서 선택)
         base_req = symbol_req if symbol_req else "NAS100"
         mt5_symbol, lot_base = pick_best_symbol_and_lot(base_req, FIXED_ENTRY_LOT)
         if not mt5_symbol:
@@ -439,19 +453,17 @@ def handle_signal(sig: dict) -> bool:
     log(f"[state] req={symbol_req} resolved={mt5_symbol}: now={side_now} {vol_now}lot, "
         f"action={action}, market_pos={market_position}, pos_after={pos_after}, contracts={contracts}")
 
-    # 종료 의도: market_position=='flat' 또는 action이 종료 계열
+    # 종료 의도
     exit_intent = (market_position == "flat") or (action in EXIT_ACTIONS)
 
-    # 종료 신호 처리 (절대 신규 진입 금지)
+    # 종료 처리
     if exit_intent:
         targets = cand_syms if cand_syms else build_candidate_symbols(mt5_symbol)
         close_all_for_candidates(targets)
-
         s, v = get_position(mt5_symbol)
         if s != "flat" and v > 0:
             close_by_opposites_if_any(mt5_symbol)
             return close_all(mt5_symbol)
-
         log("[SKIP] exit-intent handled (flat/closed)")
         return True
 
@@ -466,9 +478,8 @@ def handle_signal(sig: dict) -> bool:
     if side_now == "long" and action == "sell":
         info = mt5.symbol_info(mt5_symbol)
         step = (info and info.volume_step) or 0.01
-        frac = compute_fraction_for_partial(contracts or 0.0, pos_after or vol_now)
-        lot_close = round_down_to_step(vol_now * frac, step)
-        lot_close = min(max(lot_close, step), vol_now)
+        frac = ((contracts or 0.0) / ((contracts or 0.0) + (pos_after or vol_now))) if ((contracts or 0.0) + (pos_after or vol_now))>0 else 1.0
+        lot_close = max(step, min(vol_now, math.floor((vol_now * frac) / step) * step))
         if lot_close <= 0:
             log("[INFO] calc close_qty <= 0 -> skip")
             return True
@@ -477,9 +488,8 @@ def handle_signal(sig: dict) -> bool:
     if side_now == "short" and action == "buy":
         info = mt5.symbol_info(mt5_symbol)
         step = (info and info.volume_step) or 0.01
-        frac = compute_fraction_for_partial(contracts or 0.0, pos_after or vol_now)
-        lot_close = round_down_to_step(vol_now * frac, step)
-        lot_close = min(max(lot_close, step), vol_now)
+        frac = ((contracts or 0.0) / ((contracts or 0.0) + (pos_after or vol_now))) if ((contracts or 0.0) + (pos_after or vol_now))>0 else 1.0
+        lot_close = max(step, min(vol_now, math.floor((vol_now * frac) / step) * step))
         if lot_close <= 0:
             log("[INFO] calc close_qty <= 0 -> skip")
             return True
@@ -505,16 +515,13 @@ def poll_loop():
             ack_ids = []
             for it in items:
                 item_id = it.get("id")
-                # 서버가 signal/payload/그 자체 형태 어느 것이든 수용
-                sig = it.get("signal") or it.get("payload") or it
-
+                sig = it.get("signal") or it.get("payload") or it  # 포맷 다양성 수용
                 ok = False
                 try:
                     ok = handle_signal(sig)
                 except Exception:
                     log("[ERR] handle_signal exception:\n" + traceback.format_exc())
                     ok = False
-
                 if ok and item_id is not None:
                     ack_ids.append(item_id)
 
