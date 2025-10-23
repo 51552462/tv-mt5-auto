@@ -5,7 +5,7 @@
 # - /pull 응답이 signal 또는 payload(또는 항목 자체)여도 파싱
 # - 심볼 누락 시 NAS100 계열(US100/USTEC) 자동 탐색
 # - FIXED_ENTRY_LOT는 스텝에 '올림(ceil)'으로 맞춰 최소 지정 랏을 보장
-# - 마진 부족 시 스텝 단위로 낮춰 가능한 최대 랏으로 진입
+# - (선택) REQUIRE_MARGIN_CHECK=1 이면 마진 부족 시 스텝 단위로 낮춤
 # --------------------------------------------------------------------
 
 import os
@@ -30,7 +30,10 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 POLL_INTERVAL_SEC = float(os.environ.get("POLL_INTERVAL_SEC", "1.0"))
 MAX_BATCH = int(os.environ.get("MAX_BATCH", "10"))
 
-# 심볼 별칭(브로커마다 이름이 다름)
+# 기본: 마진 체크로 랏을 깎지 않음(문제 브로커 회피). 켜려면 1/true/yes.
+REQUIRE_MARGIN_CHECK = os.environ.get("REQUIRE_MARGIN_CHECK", "0").strip().lower() in ("1","true","yes")
+
+# 심볼 별칭(브로커마다 이름 다름)
 FINAL_ALIASES: Dict[str, List[str]] = {
     "NQ1!":   ["NAS100", "US100", "USTEC"],
     "NAS100": ["NAS100", "US100", "USTEC"],
@@ -68,6 +71,7 @@ def ensure_mt5_initialized() -> bool:
             log("[ERR] MT5 account_info None")
             return False
         log(f"MT5 ok: {acct.login}, {acct.company}")
+        log(f"env FIXED_ENTRY_LOT={FIXED_ENTRY_LOT} REQUIRE_MARGIN_CHECK={REQUIRE_MARGIN_CHECK}")
         return True
     except Exception:
         log("[ERR] MT5 initialize exception:\n" + traceback.format_exc())
@@ -132,7 +136,7 @@ def detect_open_symbol_from_candidates(candidates: List[str]) -> Optional[str]:
 
 
 def detect_any_open_from_alias_pool() -> Optional[str]:
-    """심볼 누락 시 NAS100 계열에서 열려있는 심볼 자동 탐색."""
+    """심볼 누락시 NAS100 계열에서 열려있는 심볼 자동 탐색."""
     for base in ["NAS100", "US100", "USTEC"]:
         cands = build_candidate_symbols(base)
         sym = detect_open_symbol_from_candidates(cands)
@@ -155,11 +159,57 @@ def floor_to_step(x: float, step: float) -> float:
 
 
 # ============== 랏 결정 ==============
+def _decide_lot_no_margin(info, base_lot: float) -> float:
+    """마진 체크 없이: base_lot 이상을 step 올림으로 보장."""
+    step = info.volume_step or 0.01
+    vol_min = info.volume_min or step
+    vol_max = info.volume_max or 0.0
+
+    desired = max(vol_min, base_lot)
+    lot = ceil_to_step(desired, step)
+
+    if vol_max and lot > vol_max:
+        lot = floor_to_step(vol_max, step)
+
+    return max(vol_min, lot)
+
+
+def _decide_lot_with_margin(symbol: str, info, base_lot: float) -> float:
+    """마진 체크 모드: 부족하면 step 단위로 낮추며 최대치 선택."""
+    step = info.volume_step or 0.01
+    vol_min = info.volume_min or step
+    vol_max = info.volume_max or 0.0
+
+    desired = max(vol_min, base_lot)
+    lot = ceil_to_step(desired, step)
+
+    price = info.ask or info.bid
+    acct = mt5.account_info()
+    free = (acct and acct.margin_free) or 0.0
+
+    def enough(qty: float) -> bool:
+        if not price:
+            return True
+        m = mt5.order_calc_margin(mt5.ORDER_TYPE_BUY, symbol, qty, price)
+        if m is None:
+            m = mt5.order_calc_margin(mt5.ORDER_TYPE_SELL, symbol, qty, price)
+        return (m is None) or (free >= m)
+
+    test = lot
+    if vol_max and test > vol_max:
+        test = floor_to_step(vol_max, step)
+
+    while test >= vol_min and not enough(test):
+        test = round(floor_to_step(test - step, step), 10)
+
+    return max(vol_min, test)
+
+
 def pick_best_symbol_and_lot(requested_symbol: str, base_lot: float) -> Tuple[Optional[str], Optional[float]]:
     """
-    진입 상황:
-      - base_lot 이상이 되도록 step에 '올림' 맞춤
-      - 마진 부족이면 step 단위로 줄여가며 가능한 최대 랏 선택(최소 volume_min)
+    진입 상황에서 사용:
+      - 기본은 마진 체크 없이 base_lot 이상(스텝 올림) 보장
+      - REQUIRE_MARGIN_CHECK=1 일 때만 마진 체크로 스텝 다운
     """
     if not requested_symbol:
         return None, None
@@ -186,9 +236,6 @@ def pick_best_symbol_and_lot(requested_symbol: str, base_lot: float) -> Tuple[Op
     seen = set()
     cand = [x for x in cand if not (x in seen or seen.add(x))]
 
-    acct = mt5.account_info()
-    free = (acct and acct.margin_free) or 0.0
-
     for sym in cand:
         info = mt5.symbol_info(sym)
         if not info:
@@ -199,32 +246,11 @@ def pick_best_symbol_and_lot(requested_symbol: str, base_lot: float) -> Tuple[Op
             if not info or not info.visible:
                 continue
 
+        lot = _decide_lot_with_margin(sym, info, base_lot) if REQUIRE_MARGIN_CHECK else _decide_lot_no_margin(info, base_lot)
         step = info.volume_step or 0.01
         vol_min = info.volume_min or step
-
-        # 1) 사용자가 지정한 값 이상으로 올림하여 맞춤
-        desired = max(vol_min, base_lot)
-        lot = ceil_to_step(desired, step)
-
-        # 2) 마진 체크, 부족하면 step 단위로 감소
-        price = info.ask or info.bid
-        if not price:
-            continue
-
-        def enough(qty: float) -> bool:
-            m = mt5.order_calc_margin(mt5.ORDER_TYPE_BUY, sym, qty, price)
-            if m is None:
-                m = mt5.order_calc_margin(mt5.ORDER_TYPE_SELL, sym, qty, price)
-            return (m is not None) and (free >= m)
-
-        # step 내림 루프(최소 vol_min 이상)
-        test_lot = lot
-        while test_lot >= vol_min and not enough(test_lot):
-            test_lot = round(floor_to_step(test_lot - step, step), 10)
-
-        if test_lot >= vol_min and enough(test_lot):
-            log(f"[lot-pick] sym={sym} step={step} min={vol_min} base={base_lot} -> lot={test_lot}")
-            return sym, test_lot
+        log(f"[lot-pick] sym={sym} step={step} min={vol_min} base={base_lot} => lot={lot}")
+        return sym, lot
 
     return None, None
 
@@ -346,7 +372,7 @@ def _close_volume_by_tickets(symbol: str, side_now: str, vol_to_close: float) ->
             "action": mt5.TRADE_ACTION_DEAL,
             "symbol": symbol,
             "type": (mt5.ORDER_TYPE_SELL if side_now == "long" else mt5.ORDER_TYPE_BUY),
-            "position": p.ticket,           # ← 티켓 지정: 신규반대 진입 방지
+            "position": p.ticket,           # 티켓 지정: 신규반대 진입 방지
             "volume": qty,
             "price": price,
             "deviation": 50,
@@ -438,7 +464,6 @@ def handle_signal(sig: dict) -> bool:
         info = mt5.symbol_info(mt5_symbol)
         step = (info and info.volume_step) or 0.01
         vol_min = (info and info.volume_min) or step
-        # 사용자가 설정한 값 이상으로 올림
         desired = max(vol_min, FIXED_ENTRY_LOT)
         lot_base = ceil_to_step(desired, step)
         log(f"[lot-base] resolved={mt5_symbol} step={step} min={vol_min} FIXED={FIXED_ENTRY_LOT} -> {lot_base}")
@@ -472,13 +497,14 @@ def handle_signal(sig: dict) -> bool:
         if action not in ("buy", "sell"):
             log("[SKIP] unknown action for flat state")
             return True
-        desired = "buy" if action == "buy" else "sell"
-        return send_market_order(mt5_symbol, desired, lot_base)
+        desired_side = "buy" if action == "buy" else "sell"
+        return send_market_order(mt5_symbol, desired_side, lot_base)
 
     if side_now == "long" and action == "sell":
         info = mt5.symbol_info(mt5_symbol)
         step = (info and info.volume_step) or 0.01
-        frac = ((contracts or 0.0) / ((contracts or 0.0) + (pos_after or vol_now))) if ((contracts or 0.0) + (pos_after or vol_now))>0 else 1.0
+        base = (contracts or 0.0) + (pos_after or vol_now)
+        frac = (contracts or 0.0) / base if base > 0 else 1.0
         lot_close = max(step, min(vol_now, math.floor((vol_now * frac) / step) * step))
         if lot_close <= 0:
             log("[INFO] calc close_qty <= 0 -> skip")
@@ -488,7 +514,8 @@ def handle_signal(sig: dict) -> bool:
     if side_now == "short" and action == "buy":
         info = mt5.symbol_info(mt5_symbol)
         step = (info and info.volume_step) or 0.01
-        frac = ((contracts or 0.0) / ((contracts or 0.0) + (pos_after or vol_now))) if ((contracts or 0.0) + (pos_after or vol_now))>0 else 1.0
+        base = (contracts or 0.0) + (pos_after or vol_now)
+        frac = (contracts or 0.0) / base if base > 0 else 1.0
         lot_close = max(step, min(vol_now, math.floor((vol_now * frac) / step) * step))
         if lot_close <= 0:
             log("[INFO] calc close_qty <= 0 -> skip")
@@ -515,7 +542,8 @@ def poll_loop():
             ack_ids = []
             for it in items:
                 item_id = it.get("id")
-                sig = it.get("signal") or it.get("payload") or it  # 포맷 다양성 수용
+                # 서버가 signal/payload/그 자체 형태 어느 것이든 수용
+                sig = it.get("signal") or it.get("payload") or it
                 ok = False
                 try:
                     ok = handle_signal(sig)
