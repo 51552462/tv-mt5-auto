@@ -4,7 +4,7 @@
 # - 종료(손절/전량) 신호에서 신규 진입 금지(티켓 지정 DEAL + CLOSE_BY)
 # - /pull 응답이 signal 또는 payload(또는 항목 자체)여도 파싱
 # - 심볼 누락/이상 시 NAS100 계열(US100/USTEC) 자동 탐색하여 진입 가능
-# - exit 판정 강화: market_position=="flat" 또는 action in EXIT_ACTIONS 만 종료로 간주
+# - exit 판정: market_position=="flat" 또는 action in EXIT_ACTIONS 만 종료로 간주
 # --------------------------------------------------------------------
 
 import os
@@ -21,7 +21,7 @@ import MetaTrader5 as mt5
 # ============== 환경변수 ==============
 SERVER_URL = os.environ.get("SERVER_URL", "").rstrip("/")
 AGENT_KEY = os.environ.get("AGENT_KEY", "")
-FIXED_ENTRY_LOT = float(os.environ.get("FIXED_ENTRY_LOT", "0.01"))
+FIXED_ENTRY_LOT = float(os.environ.get("FIXED_ENTRY_LOT", "0.1"))
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
@@ -35,6 +35,7 @@ FINAL_ALIASES: Dict[str, List[str]] = {
     "NAS100": ["NAS100", "US100", "USTEC"],
     "US100":  ["US100", "NAS100", "USTEC"],
     "USTEC":  ["USTEC", "US100", "NAS100"],
+    "EURUSD": ["EURUSD", "EURUSD.m", "EURUSD.micro"],
 }
 
 
@@ -270,7 +271,7 @@ def close_by_opposites_if_any(symbol: str) -> bool:
             if qty <= 0:
                 continue
             req = {
-                "action": mt5.TRADE_ACTION_CLOSE_BY",
+                "action": mt5.TRADE_ACTION_CLOSE_BY,  # ← 여기 따옴표 오류 수정 완료
                 "symbol": symbol,
                 "position": b.ticket,
                 "position_by": s.ticket,
@@ -300,7 +301,7 @@ def _close_volume_by_tickets(symbol: str, side_now: str, vol_to_close: float) ->
     info = mt5.symbol_info(symbol)
     if not info or not info.visible:
         mt5.symbol_select(symbol, True)
-    info = mt5.symbol_info(symbol)
+        info = mt5.symbol_info(symbol)
 
     step = (info and info.volume_step) or 0.01
     price = (info.bid if side_now == "long" else info.ask)
