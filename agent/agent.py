@@ -353,7 +353,7 @@ def _close_volume_by_tickets(symbol: str, side_now: str, vol_to_close: float) ->
             "action": mt5.TRADE_ACTION_DEAL,
             "symbol": symbol,
             "type": (mt5.ORDER_TYPE_SELL if side_now == "long" else mt5.ORDER_TYPE_BUY),
-            "position": p.ticket,
+            "position": p.ticket,  # ← 반드시 티켓 지정해서 반대 신규 진입 방지
             "volume": close_qty,
             "price": price,
             "deviation": 50,
@@ -530,14 +530,18 @@ def poll_loop():
             ack_ids = []
             for it in items:
                 item_id = it.get("id")
-                sig = it.get("signal") or {}
+
+                # ★★★ 핵심 수정: 서버가 'payload'로 줄 수도 있고, 'signal'로 줄 수도 있음
+                #               (둘 다 없으면 항목 자체를 신호로 간주)
+                sig = it.get("signal") or it.get("payload") or it
+
                 ok = False
                 try:
                     ok = handle_signal(sig)
                 except Exception:
                     log("[ERR] handle_signal exception:\n" + traceback.format_exc())
                     ok = False
-                if ok:
+                if ok and item_id is not None:
                     ack_ids.append(item_id)
 
             if ack_ids:
