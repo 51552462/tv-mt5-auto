@@ -6,6 +6,7 @@
 # - 심볼 누락 시 NAS100 계열(US100/USTEC) 자동 탐색
 # - FIXED_ENTRY_LOT는 스텝에 '올림(ceil)'으로 맞춰 최소 지정 랏을 보장
 # - (선택) REQUIRE_MARGIN_CHECK=1 이면 마진 부족 시 스텝 단위로 낮춤
+# - ★ NO_MONEY(10019) 발생 시 스텝 단위로 즉시 줄여 재시도(진입만)
 # --------------------------------------------------------------------
 
 import os
@@ -30,10 +31,10 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 POLL_INTERVAL_SEC = float(os.environ.get("POLL_INTERVAL_SEC", "1.0"))
 MAX_BATCH = int(os.environ.get("MAX_BATCH", "10"))
 
-# 기본: 마진 체크로 랏을 깎지 않음(문제 브로커 회피). 켜려면 1/true/yes.
-REQUIRE_MARGIN_CHECK = os.environ.get("REQUIRE_MARGIN_CHECK", "0").strip().lower() in ("1","true","yes")
+# 기본값: 마진 체크로 랏을 깎지 않음. (필요 시 1 로)
+REQUIRE_MARGIN_CHECK = os.environ.get("REQUIRE_MARGIN_CHECK", "0").strip() in ("1","true","True","YES","yes")
 
-# 심볼 별칭(브로커마다 이름 다름)
+# 심볼 별칭(브로커마다 이름이 다름)
 FINAL_ALIASES: Dict[str, List[str]] = {
     "NQ1!":   ["NAS100", "US100", "USTEC"],
     "NAS100": ["NAS100", "US100", "USTEC"],
@@ -71,7 +72,6 @@ def ensure_mt5_initialized() -> bool:
             log("[ERR] MT5 account_info None")
             return False
         log(f"MT5 ok: {acct.login}, {acct.company}")
-        log(f"env FIXED_ENTRY_LOT={FIXED_ENTRY_LOT} REQUIRE_MARGIN_CHECK={REQUIRE_MARGIN_CHECK}")
         return True
     except Exception:
         log("[ERR] MT5 initialize exception:\n" + traceback.format_exc())
@@ -169,7 +169,8 @@ def _decide_lot_no_margin(info, base_lot: float) -> float:
     lot = ceil_to_step(desired, step)
 
     if vol_max and lot > vol_max:
-        lot = floor_to_step(vol_max, step)
+        lot = vol_max
+        lot = floor_to_step(lot, step)
 
     return max(vol_min, lot)
 
@@ -189,10 +190,12 @@ def _decide_lot_with_margin(symbol: str, info, base_lot: float) -> float:
 
     def enough(qty: float) -> bool:
         if not price:
+            # 가격 없으면 판단 불가 → 일단 허용
             return True
         m = mt5.order_calc_margin(mt5.ORDER_TYPE_BUY, symbol, qty, price)
         if m is None:
             m = mt5.order_calc_margin(mt5.ORDER_TYPE_SELL, symbol, qty, price)
+        # margin 계산이 None 이면 허용(지수 CFD 브로커 일부 케이스)
         return (m is None) or (free >= m)
 
     test = lot
@@ -246,7 +249,11 @@ def pick_best_symbol_and_lot(requested_symbol: str, base_lot: float) -> Tuple[Op
             if not info or not info.visible:
                 continue
 
-        lot = _decide_lot_with_margin(sym, info, base_lot) if REQUIRE_MARGIN_CHECK else _decide_lot_no_margin(info, base_lot)
+        if REQUIRE_MARGIN_CHECK:
+            lot = _decide_lot_with_margin(sym, info, base_lot)
+        else:
+            lot = _decide_lot_no_margin(info, base_lot)
+
         step = info.volume_step or 0.01
         vol_min = info.volume_min or step
         log(f"[lot-pick] sym={sym} step={step} min={vol_min} base={base_lot} => lot={lot}")
@@ -273,26 +280,58 @@ def get_position(symbol: str) -> Tuple[str, float]:
 
 
 def send_market_order(symbol: str, side: str, lot: float) -> bool:
+    """
+    ★ 변경 핵심:
+    - 첫 시도에서 10019(NO_MONEY)면 symbol_info의 volume_step만큼
+      한 칸씩 줄여가며 재시도(최소 volume_min 이상).
+    - 각 시도마다 최신 호가로 주문.
+    """
     info = mt5.symbol_info(symbol)
     if not info or not info.visible:
         mt5.symbol_select(symbol, True)
         info = mt5.symbol_info(symbol)
-    price = info.ask if side == "buy" else info.bid
-    req = {
-        "action": mt5.TRADE_ACTION_DEAL,
-        "symbol": symbol,
-        "type": (mt5.ORDER_TYPE_BUY if side == "buy" else mt5.ORDER_TYPE_SELL),
-        "volume": lot,
-        "price": price,
-        "deviation": 50,
-        "type_filling": mt5.ORDER_FILLING_IOC,
-    }
-    r = mt5.order_send(req)
-    if r and r.retcode == mt5.TRADE_RETCODE_DONE:
-        log(f"[OK] market {side} {lot} {symbol}")
-        tg(f"✅ ENTRY {side.upper()} {lot} {symbol}")
-        return True
-    log(f"[ERR] order_send ret={getattr(r,'retcode',None)} {getattr(r,'comment','')}")
+
+    step = (info and info.volume_step) or 0.01
+    vol_min = (info and info.volume_min) or step
+    vol = max(vol_min, lot)
+
+    def _price_and_type():
+        i = mt5.symbol_info(symbol)
+        if not i or not i.visible:
+            mt5.symbol_select(symbol, True)
+            i = mt5.symbol_info(symbol)
+        order_type = mt5.ORDER_TYPE_BUY if side == "buy" else mt5.ORDER_TYPE_SELL
+        price = i.ask if side == "buy" else i.bid
+        return order_type, price
+
+    while vol >= vol_min:
+        order_type, price = _price_and_type()
+        req = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": symbol,
+            "type": order_type,
+            "volume": vol,
+            "price": price,
+            "deviation": 50,
+            "type_filling": mt5.ORDER_FILLING_IOC,
+        }
+        r = mt5.order_send(req)
+        if r and r.retcode == mt5.TRADE_RETCODE_DONE:
+            log(f"[OK] market {side} {vol} {symbol}")
+            tg(f"✅ ENTRY {side.upper()} {vol} {symbol}")
+            return True
+
+        ret = getattr(r, "retcode", None)
+        comment = getattr(r, "comment", "")
+        log(f"[ERR] order_send ret={ret} {comment} (try vol={vol})")
+
+        # ★ 여기서만 재시도: NO_MONEY → 스텝만큼 낮춰 재시도
+        if ret == mt5.TRADE_RETCODE_NO_MONEY:
+            vol = round(floor_to_step(vol - step, step), 10)
+            continue
+        # 그 외 에러는 실패 처리
+        break
+
     tg(f"⛔ ENTRY FAIL {symbol}")
     return False
 
@@ -372,7 +411,7 @@ def _close_volume_by_tickets(symbol: str, side_now: str, vol_to_close: float) ->
             "action": mt5.TRADE_ACTION_DEAL,
             "symbol": symbol,
             "type": (mt5.ORDER_TYPE_SELL if side_now == "long" else mt5.ORDER_TYPE_BUY),
-            "position": p.ticket,           # 티켓 지정: 신규반대 진입 방지
+            "position": p.ticket,           # ← 티켓 지정: 신규반대 진입 방지
             "volume": qty,
             "price": price,
             "deviation": 50,
@@ -497,8 +536,8 @@ def handle_signal(sig: dict) -> bool:
         if action not in ("buy", "sell"):
             log("[SKIP] unknown action for flat state")
             return True
-        desired_side = "buy" if action == "buy" else "sell"
-        return send_market_order(mt5_symbol, desired_side, lot_base)
+        desired = "buy" if action == "buy" else "sell"
+        return send_market_order(mt5_symbol, desired, lot_base)
 
     if side_now == "long" and action == "sell":
         info = mt5.symbol_info(mt5_symbol)
@@ -528,6 +567,7 @@ def handle_signal(sig: dict) -> bool:
 
 # ============== 폴링 루프 ==============
 def poll_loop():
+    log(f"env FIXED_ENTRY_LOT={FIXED_ENTRY_LOT} REQUIRE_MARGIN_CHECK={REQUIRE_MARGIN_CHECK}")
     log(f"Agent start. server={SERVER_URL}")
     tg("🤖 MT5 Agent started")
 
@@ -542,8 +582,7 @@ def poll_loop():
             ack_ids = []
             for it in items:
                 item_id = it.get("id")
-                # 서버가 signal/payload/그 자체 형태 어느 것이든 수용
-                sig = it.get("signal") or it.get("payload") or it
+                sig = it.get("signal") or it.get("payload") or it  # 포맷 다양성 수용
                 ok = False
                 try:
                     ok = handle_signal(sig)
