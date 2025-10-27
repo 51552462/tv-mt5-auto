@@ -3,7 +3,7 @@
 MetaTrader5 Windows Agent for TradingView → Render(FastAPI) → MT5 live trading
 
 - Keeps original NAS100 pipeline intact.
-- ADDED: DEFAULT_SYMBOL, BTC aliases, BTC-first symbol detection fallback.
+- ADDED(옵션A): IGNORE_SIGNAL_CONTRACTS, DEFAULT_SYMBOL, BTC aliases, BTC-first symbol detection fallback.
 - Accepts flexible signal payloads: symbol|sym|ticker|s, action, contracts, pos_after, market_position, order_price, time.
 - Supports partial close by target "pos_after" or incremental "contracts".
 - Optional margin check and split entries.
@@ -46,7 +46,7 @@ if not AGENT_KEY:
     log.error("AGENT_KEY env is required.")
     sys.exit(1)
 
-# ADDED: 기본 심볼 설정 (트뷰 알림에 심볼이 없을 때 사용)
+# 기본 심볼(트뷰 알림에 심볼이 없을 때 사용)
 DEFAULT_SYMBOL = os.environ.get("DEFAULT_SYMBOL", "").strip()
 
 # optional features
@@ -61,6 +61,9 @@ POLL_INTERVAL_SEC = int(os.environ.get("POLL_INTERVAL_SEC", "2").strip())
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+
+# ADDED(옵션A): 시그널의 contracts(수량) 완전 무시 여부
+IGNORE_SIGNAL_CONTRACTS = os.environ.get("IGNORE_SIGNAL_CONTRACTS", "0").strip() == "1"
 
 # -----------------------------
 # Symbol Aliases (kept + BTC added)
@@ -277,14 +280,14 @@ def detect_open_symbol_from_candidates(cands: List[str]) -> Optional[str]:
 
 def detect_any_open_from_alias_pool() -> Optional[str]:
     """
-    ADDED: DEFAULT_SYMBOL and BTC-first fallback, then NAS.
+    DEFAULT_SYMBOL and BTC-first fallback, then NAS.
     Keeps NAS behavior intact while enabling BTC quickly.
     """
     bases: List[str] = []
     if DEFAULT_SYMBOL:
         bases.append(DEFAULT_SYMBOL.upper())
 
-    # ADDED: BTC 우선 탐색
+    # BTC 우선 탐색
     bases += ["BTCUSD", "BTCUSDT", "NAS100", "US100", "USTEC"]
 
     seen = set()
@@ -352,7 +355,7 @@ def target_by_pos_after(sym: str, pos_after: float, hint_side: Optional[str]) ->
 
     # If the signal included market_position explicitly:
     # long -> tgt positive, short -> tgt negative, flat -> 0
-    mp = str((hint_side or "")).lower()
+    mp = str((hint_side or "")).lower().strip()
     if mp == "long":
         tgt_net = abs(pos_after)
     elif mp == "short":
@@ -417,8 +420,7 @@ def parse_action(sig: dict) -> str:
         return "buy"
     if a in ("sell", "short", "open_short"):
         return "sell"
-    # if market_position exists and pos_after changes, action can be derived,
-    # but we default to 'buy' to avoid ignoring a valid instruction.
+    # default to 'buy' if unspecified
     return "buy"
 
 def parse_market_position(sig: dict) -> Optional[str]:
@@ -446,7 +448,7 @@ def parse_pos_after(sig: dict) -> Optional[float]:
 def handle_signal(sig: dict) -> bool:
     try:
         sym_req = read_symbol_from_signal(sig)
-        # ADDED: 기본 심볼/ BTC fallback
+        # 기본 심볼/ BTC fallback
         if not sym_req:
             sym_req = DEFAULT_SYMBOL or "BTCUSD"
 
@@ -456,11 +458,16 @@ def handle_signal(sig: dict) -> bool:
         contracts = parse_contracts(sig)
         market_pos = parse_market_position(sig)
 
+        # ADDED(옵션A): 시그널 contracts 완전 무시 → 항상 FIXED_ENTRY_LOT 경로로 유도
+        if IGNORE_SIGNAL_CONTRACTS:
+            contracts = None
+
         order_px = sig.get("order_price")
         tstamp = sig.get("time")
 
-        log.info(f"Signal: sym={sym} act={action} pos_after={pos_after} contracts={contracts} mp={market_pos} px={order_px} t={tstamp}")
+        log.info(f"Signal: sym={sym} act={action} pos_after={pos_after} contracts={'IGNORED' if IGNORE_SIGNAL_CONTRACTS else contracts} mp={market_pos} px={order_px} t={tstamp}")
 
+        # pos_after가 오면 목표 보유량으로 정확히 맞춤(부분청산/전량청산 모두 안전)
         if pos_after is not None:
             ok = target_by_pos_after(sym, pos_after, market_pos)
             if ok:
@@ -469,6 +476,7 @@ def handle_signal(sig: dict) -> bool:
                 tg_send(f"❌ pos_after fail {sym}: target {market_pos or ''} {pos_after}")
             return ok
 
+        # (옵션A에서 contracts는 None이므로 아래 블록은 일반적으로 건너뜀)
         if contracts is not None:
             ok = apply_by_contracts(sym, action, contracts)
             if ok:
@@ -477,26 +485,12 @@ def handle_signal(sig: dict) -> bool:
                 tg_send(f"❌ contracts fail {sym}: {action} {contracts}")
             return ok
 
-        # If no pos_after and no contracts provided, we can infer:
-        # - market_position=flat => try to flatten
-        if market_pos == "flat":
-            long_v, short_v = get_position_volume(sym)
-            net = long_v - short_v
-            if abs(net) < 1e-9:
-                log.info(f"{sym} already flat.")
-                return True
-            if net > 0:
-                # have net long -> sell to flat
-                return apply_order(sym, "sell", net)
-            else:
-                # net short -> buy to flat
-                return apply_order(sym, "buy", abs(net))
-
-        # fallback: fixed entry lot (if provided) or symbol min step
+        # pos_after/ contracts 둘 다 없으면 → 항상 고정 랏으로 집행 (롱/숏 모두 동일 처리)
         vol = FIXED_ENTRY_LOT
         if vol is None:
             info = get_symbol_info(sym)
             vol = info.volume_min if info and info.volume_min else 0.01
+
         ok = apply_by_contracts(sym, action, vol)
         return ok
 
