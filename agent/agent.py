@@ -31,26 +31,22 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 POLL_INTERVAL_SEC = float(os.environ.get("POLL_INTERVAL_SEC", "1.0"))
 MAX_BATCH = int(os.environ.get("MAX_BATCH", "10"))
 
-# 기본값: 마진 체크로 랏을 깎지 않음. (필요 시 1 로)
 REQUIRE_MARGIN_CHECK = os.environ.get("REQUIRE_MARGIN_CHECK", "0").strip() in ("1","true","True","YES","yes")
-# ★ 목표 랏 미충족 시 0.01씩 쪼개서 추가 체결 허용
 ALLOW_SPLIT_ENTRIES = os.environ.get("ALLOW_SPLIT_ENTRIES", "1").strip() in ("1","true","True","YES","yes")
 
-# ADDED: 시그널에 심볼이 비어올 때 기본 적용할 심볼(BTCUSD 권장)
 DEFAULT_SYMBOL = os.environ.get("DEFAULT_SYMBOL", "").strip()
 
-# ADDED: 시그널 contracts/pos_after(평탄 예외) 무시하고 고정 랏/분할 랏으로만 운용
 STRICT_FIXED_MODE = os.environ.get("STRICT_FIXED_MODE", "0").strip() in ("1","true","True","YES","yes")
 
-# ADDED: 부분 청산에 사용할 고정 랏(없으면 FIXED_ENTRY_LOT 또는 vol_min 사용)
 PARTIAL_LOT = os.environ.get("PARTIAL_LOT", "").strip()
 PARTIAL_LOT = float(PARTIAL_LOT) if PARTIAL_LOT else None
 
-# ADDED: 시그널 contracts를 무시(엔트리/증가·부분청산 계산용으로 사용 안 함)
 IGNORE_SIGNAL_CONTRACTS = os.environ.get("IGNORE_SIGNAL_CONTRACTS", "1").strip() in ("1","true","True","YES","yes")
 
 
-# 심볼 별칭(브로커마다 이름이 다름)
+# ===========================
+# 심볼 별칭 추가 (BTC + NAS + ETH)
+# ===========================
 FINAL_ALIASES: Dict[str, List[str]] = {
     "NQ1!":   ["NAS100", "US100", "USTEC"],
     "NAS100": ["NAS100", "US100", "USTEC"],
@@ -58,13 +54,20 @@ FINAL_ALIASES: Dict[str, List[str]] = {
     "USTEC":  ["USTEC", "US100", "NAS100"],
     "EURUSD": ["EURUSD", "EURUSD.m", "EURUSD.micro"],
 
-    # ADDED: BTC 계열 별칭
+    # 비트코인
     "BTCUSD":  ["BTCUSD", "BTCUSDT", "BTCUSD.m", "BTCUSD.micro", "BTCUSD.a", "XBTUSD"],
     "BTCUSDT": ["BTCUSDT", "BTCUSD", "BTCUSD.m", "BTCUSD.micro", "XBTUSD"],
+
+    # ADDED (Ethereum)
+    "ETHUSD":  ["ETHUSD", "ETHUSDT", "ETHUSD.m", "ETHUSDmicro", "XETUSD", "XETHUSD"],
+    "ETHUSDT": ["ETHUSDT", "ETHUSD", "XETUSD", "XETHUSD", "ETHUSD.m", "ETHUSDmicro"],
+    "XETUSD":  ["XETUSD", "ETHUSD", "ETHUSDT", "ETHUSD.m", "ETHUSDmicro"],
 }
 
 
-# ============== 유틸 ==============
+# ===========================
+# 기본 함수 / 유틸
+# ===========================
 def log(msg: str):
     print(time.strftime("[%Y-%m-%d %H:%M:%S]"), msg, flush=True)
 
@@ -114,7 +117,9 @@ def get_health() -> dict:
         return {}
 
 
-# ============== 심볼 탐지 ==============
+# ===========================
+# 심볼 탐색
+# ===========================
 def build_candidate_symbols(requested_symbol: str) -> List[str]:
     req = (requested_symbol or "").strip()
     if not req:
@@ -152,19 +157,17 @@ def detect_open_symbol_from_candidates(candidates: List[str]) -> Optional[str]:
 
 
 def detect_any_open_from_alias_pool() -> Optional[str]:
-    # ADDED: DEFAULT_SYMBOL 우선 → BTC → NAS 순으로 자동 탐색
+    # 기본 심볼 탐색 순서 확장
     bases = []
     if DEFAULT_SYMBOL:
         bases.append(DEFAULT_SYMBOL)
-    bases += ["BTCUSD", "BTCUSDT", "NAS100", "US100", "USTEC"]
-
+    bases += ["BTCUSD", "BTCUSDT", "NAS100", "US100", "USTEC", "ETHUSD", "ETHUSDT", "XETUSD"]  # ADDED (Ethereum)
     for base in bases:
         cands = build_candidate_symbols(base)
         sym = detect_open_symbol_from_candidates(cands)
         if sym:
             return sym
     return None
-
 
 # ============== 보조 ==============
 def ceil_to_step(x: float, step: float) -> float:
@@ -700,3 +703,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
