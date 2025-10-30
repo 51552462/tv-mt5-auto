@@ -19,6 +19,21 @@ from typing import Optional, Tuple, Dict, Any, List
 import requests
 import MetaTrader5 as mt5
 
+# ── HTTP resilient session (ADDED) ──────────────────────────────────────────
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+_http_retry = Retry(
+    total=5,                   # 최대 5회 재시도
+    backoff_factor=0.8,        # 지수 백오프 (0.8, 1.6, 2.4, …)
+    status_forcelist=[429, 502, 503, 504],
+    allowed_methods=["GET", "POST"]
+)
+_http = requests.Session()
+_http.mount("http://",  HTTPAdapter(max_retries=_http_retry))
+_http.mount("https://", HTTPAdapter(max_retries=_http_retry))
+# ───────────────────────────────────────────────────────────────────────────
+
 
 # ============== 환경변수 ==============
 SERVER_URL = os.environ.get("SERVER_URL", "").rstrip("/")
@@ -58,7 +73,7 @@ FINAL_ALIASES: Dict[str, List[str]] = {
     "BTCUSD":  ["BTCUSD", "BTCUSDT", "BTCUSD.m", "BTCUSD.micro", "BTCUSD.a", "XBTUSD"],
     "BTCUSDT": ["BTCUSDT", "BTCUSD", "BTCUSD.m", "BTCUSD.micro", "XBTUSD"],
 
-    # ADDED (Ethereum)
+    # Ethereum
     "ETHUSD":  ["ETHUSD", "ETHUSDT", "ETHUSD.m", "ETHUSDmicro", "XETUSD", "XETHUSD"],
     "ETHUSDT": ["ETHUSDT", "ETHUSD", "XETUSD", "XETHUSD", "ETHUSD.m", "ETHUSDmicro"],
     "XETUSD":  ["XETUSD", "ETHUSD", "ETHUSDT", "ETHUSD.m", "ETHUSDmicro"],
@@ -101,16 +116,30 @@ def ensure_mt5_initialized() -> bool:
         return False
 
 
-def post_json(path: str, payload: dict, timeout: float = 10.0) -> dict:
+def post_json(path: str, payload: dict, timeout: float = 20.0) -> dict:
+    """Render와 통신: 연결/타임아웃/5xx를 부드럽게 흡수."""
     url = f"{SERVER_URL}{path}"
-    r = requests.post(url, json=payload, timeout=timeout)
-    r.raise_for_status()
-    return r.json()
+    try:
+        r = _http.post(url, json=payload, timeout=timeout, headers={"Connection": "keep-alive"})
+        r.raise_for_status()
+        return r.json()
+    except (requests.exceptions.ReadTimeout,
+            requests.exceptions.ConnectTimeout) as e:
+        log(f"[WARN] post_json timeout {path}: {e}")
+        return {}
+    except (requests.exceptions.ConnectionError,
+            requests.exceptions.ChunkedEncodingError,
+            requests.exceptions.HTTPError) as e:
+        log(f"[WARN] post_json conn/http err {path}: {e}")
+        return {}
+    except Exception as e:
+        log(f"[ERR] post_json fatal {path}: {e}")
+        return {}
 
 
 def get_health() -> dict:
     try:
-        r = requests.get(f"{SERVER_URL}/health", timeout=5)
+        r = _http.get(f"{SERVER_URL}/health", timeout=5)
         r.raise_for_status()
         return r.json()
     except Exception:
@@ -157,11 +186,10 @@ def detect_open_symbol_from_candidates(candidates: List[str]) -> Optional[str]:
 
 
 def detect_any_open_from_alias_pool() -> Optional[str]:
-    # 기본 심볼 탐색 순서 확장
     bases = []
     if DEFAULT_SYMBOL:
         bases.append(DEFAULT_SYMBOL)
-    bases += ["BTCUSD", "BTCUSDT", "NAS100", "US100", "USTEC", "ETHUSD", "ETHUSDT", "XETUSD"]  # ADDED (Ethereum)
+    bases += ["BTCUSD", "BTCUSDT", "NAS100", "US100", "USTEC", "ETHUSD", "ETHUSDT", "XETUSD"]
     for base in bases:
         cands = build_candidate_symbols(base)
         sym = detect_open_symbol_from_candidates(cands)
@@ -229,7 +257,6 @@ def _decide_lot_with_margin(symbol: str, info, base_lot: float) -> float:
 
 def pick_best_symbol_and_lot(requested_symbol: str, base_lot: float) -> Tuple[Optional[str], Optional[float]]:
     if not requested_symbol:
-        # ADDED: 요청 심볼이 없으면 DEFAULT_SYMBOL → NAS100 기본
         req = DEFAULT_SYMBOL or "NAS100"
     else:
         req = requested_symbol
@@ -321,10 +348,9 @@ def _send_deal(symbol: str, side: str, volume: float) -> tuple:
 
 def send_market_order(symbol: str, side: str, lot: float) -> bool:
     """
-    ★ 핵심 개선:
-      1) lot 시도 → NO_MONEY면 step씩 줄여 재시도(최소 vol_min).
-      2) 최종 체결량이 목표 미달이고 ALLOW_SPLIT_ENTRIES=1 이면
-         vol_min씩 반복 체결하여 목표 lot까지 채운다.
+    1) lot 시도 → NO_MONEY면 step씩 줄여 재시도(최소 vol_min).
+    2) 최종 체결량이 목표 미달이고 ALLOW_SPLIT_ENTRIES=1 이면
+       vol_min씩 반복 체결하여 목표 lot까지 채운다.
     """
     info = mt5.symbol_info(symbol)
     if not info or not info.visible:
@@ -350,20 +376,18 @@ def send_market_order(symbol: str, side: str, lot: float) -> bool:
             attempt = round(floor_to_step(attempt - step, step), 10)
             continue
         else:
-            # 가격 변동/거부 등 다른 사유는 바로 중단
             tg(f"⛔ ENTRY FAIL {symbol} ret={ret} {cmt}")
             return False
 
     # (2) 목표 미달이고 split 허용이면, vol_min씩 추가 체결
     if ALLOW_SPLIT_ENTRIES and filled < target:
         remain = round(target - filled, 10)
-        while remain >= vol_min - 1e-12:  # 부동소수 여유
+        while remain >= vol_min - 1e-12:
             piece = min(vol_min, remain)
             ok, ret, cmt = _send_deal(symbol, side, piece)
             if not ok:
                 log(f"[WARN] split fail ret={ret} {cmt} (piece={piece}, filled={filled})")
                 if ret == mt5.TRADE_RETCODE_NO_MONEY:
-                    # 더 못 채우면 중단
                     break
                 else:
                     break
@@ -522,20 +546,18 @@ def _read_symbol_from_signal(sig: dict) -> str:
 
 def handle_signal(sig: dict) -> bool:
     symbol_req = _read_symbol_from_signal(sig)
-    # ADDED: 심볼 누락 시 DEFAULT_SYMBOL → 기존 NAS 자동탐색
     if not symbol_req and DEFAULT_SYMBOL:
         symbol_req = DEFAULT_SYMBOL
 
     action = str(sig.get("action", "")).strip().lower()
 
-    # 시그널 수량은 옵션에 따라 무시
     contracts = sig.get("contracts", None)
     try:
         contracts = float(contracts) if (contracts is not None and str(contracts).strip() != "") else None
     except:
         contracts = None
     if IGNORE_SIGNAL_CONTRACTS:
-        contracts = None  # ADDED
+        contracts = None
 
     pos_after_raw = sig.get("pos_after", None)
     try:
@@ -556,7 +578,7 @@ def handle_signal(sig: dict) -> bool:
         lot_base = ceil_to_step(desired, step)
         log(f"[lot-base] resolved={mt5_symbol} step={step} min={vol_min} FIXED={FIXED_ENTRY_LOT} -> {lot_base}")
     else:
-        base_req = symbol_req if symbol_req else (DEFAULT_SYMBOL or "NAS100")  # ADDED
+        base_req = symbol_req if symbol_req else (DEFAULT_SYMBOL or "NAS100")
         mt5_symbol, lot_base = pick_best_symbol_and_lot(base_req, FIXED_ENTRY_LOT)
         if not mt5_symbol:
             log(f"[ERR] tradable symbol not found for req={symbol_req}")
@@ -582,7 +604,6 @@ def handle_signal(sig: dict) -> bool:
     if STRICT_FIXED_MODE:
         info = mt5.symbol_info(mt5_symbol)
         step = (info and info.volume_step) or 0.01
-        # 부분청산 랏 결정: PARTIAL_LOT > FIXED_ENTRY_LOT > vol_min 순
         partial_lot = PARTIAL_LOT if (PARTIAL_LOT and PARTIAL_LOT > 0) else (FIXED_ENTRY_LOT if FIXED_ENTRY_LOT > 0 else step)
 
         if side_now == "flat":
@@ -592,7 +613,6 @@ def handle_signal(sig: dict) -> bool:
             desired_side = "buy" if action == "buy" else "sell"
             return send_market_order(mt5_symbol, desired_side, lot_base)
 
-        # 롱 보유 중: 반대(sell)면 부분청산, 같은 방향(buy)면 추가진입
         if side_now == "long":
             if action == "sell":
                 lot_close = min(vol_now, max(step, partial_lot))
@@ -603,7 +623,6 @@ def handle_signal(sig: dict) -> bool:
                 log("[SKIP] unsupported action (STRICT, long)")
                 return True
 
-        # 숏 보유 중: 반대(buy)면 부분청산, 같은 방향(sell)면 추가진입
         if side_now == "short":
             if action == "buy":
                 lot_close = min(vol_now, max(step, partial_lot))
@@ -614,10 +633,9 @@ def handle_signal(sig: dict) -> bool:
                 log("[SKIP] unsupported action (STRICT, short)")
                 return True
 
-        # 기타(안 나올 케이스)
         return True
 
-    # === (기존 로직) STRICT 모드가 아닐 때: 원본 동작 유지 ===
+    # === STRICT 모드가 아닐 때
     if side_now == "flat":
         if action not in ("buy", "sell"):
             log("[SKIP] unknown action for flat state")
@@ -654,16 +672,17 @@ def handle_signal(sig: dict) -> bool:
 # ============== 폴링 루프 ==============
 def poll_loop():
     log(f"env FIXED_ENTRY_LOT={FIXED_ENTRY_LOT} REQUIRE_MARGIN_CHECK={REQUIRE_MARGIN_CHECK} ALLOW_SPLIT_ENTRIES={ALLOW_SPLIT_ENTRIES}")
-    log(f"env STRICT_FIXED_MODE={STRICT_FIXED_MODE} PARTIAL_LOT={PARTIAL_LOT} DEFAULT_SYMBOL='{DEFAULT_SYMBOL}' IGNORE_SIGNAL_CONTRACTS={IGNORE_SIGNAL_CONTRACTS}")  # ADDED
+    log(f"env STRICT_FIXED_MODE={STRICT_FIXED_MODE} PARTIAL_LOT={PARTIAL_LOT} DEFAULT_SYMBOL='{DEFAULT_SYMBOL}' IGNORE_SIGNAL_CONTRACTS={IGNORE_SIGNAL_CONTRACTS}")
     log(f"Agent start. server={SERVER_URL}")
     tg("🤖 MT5 Agent started")
 
+    import random
     while True:
         try:
             res = post_json("/pull", {"agent_key": AGENT_KEY, "max_batch": MAX_BATCH})
             items = res.get("items") or []
             if not items:
-                time.sleep(POLL_INTERVAL_SEC)
+                time.sleep(POLL_INTERVAL_SEC + random.random()*0.7)  # 지터로 서버 부하 분산
                 continue
 
             ack_ids = []
@@ -673,21 +692,17 @@ def poll_loop():
                 ok = False
                 try:
                     ok = handle_signal(sig)
-                except Exception:
-                    log("[ERR] handle_signal exception:\n" + traceback.format_exc())
+                except Exception as e:
+                    log(f"[ERR] handle_signal: {e}\n" + traceback.format_exc())
                     ok = False
                 if ok and item_id is not None:
                     ack_ids.append(item_id)
 
             if ack_ids:
-                try:
-                    post_json("/ack", {"agent_key": AGENT_KEY, "ids": ack_ids})
-                except Exception:
-                    log("[WARN] ack failed")
-
-        except Exception:
-            log("[ERR] poll_loop exception:\n" + traceback.format_exc())
-            time.sleep(POLL_INTERVAL_SEC)
+                _ = post_json("/ack", {"agent_key": AGENT_KEY, "ids": ack_ids})
+        except Exception as e:
+            log(f"[WARN] poll_loop exception: {e}")
+        time.sleep(POLL_INTERVAL_SEC)
 
 
 # ============== main ==============
@@ -703,4 +718,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
