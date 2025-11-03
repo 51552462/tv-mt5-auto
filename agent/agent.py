@@ -450,7 +450,7 @@ def _close_volume_by_tickets(symbol: str, side_now: str, vol_to_close: float) ->
     ttype = mt5.POSITION_TYPE_BUY if side_now == "long" else mt5.POSITION_TYPE_SELL
     poss = [p for p in (mt5.positions_get(symbol=symbol) or []) if p.type == ttype]
     if not poss:
-        log("[WARN] no positions to close]")
+        log("[WARN] no positions to close")
         return True
 
     info = mt5.symbol_info(symbol)
@@ -471,10 +471,10 @@ def _close_volume_by_tickets(symbol: str, side_now: str, vol_to_close: float) ->
         if qty <= 0:
             continue
         req = {
-            "action": mt5.TRADE_ACTION_DEAL",
+            "action": mt5.TRADE_ACTION_DEAL,
             "symbol": symbol,
             "type": (mt5.ORDER_TYPE_SELL if side_now == "long" else mt5.ORDER_TYPE_BUY),
-            "position": p.ticket,    # 티켓 지정: 신규 반대진입 방지
+            "position": p.ticket,           # 티켓 지정: 신규 반대진입 방지
             "volume": qty,
             "price": price,
             "deviation": 50,
@@ -593,6 +593,7 @@ def handle_signal(sig: dict) -> bool:
         if s != "flat" and v > 0:
             close_by_opposites_if_any(mt5_symbol)
             return close_all(mt5_symbol)
+    # 처리 후 포지션이 없으면 True
         log("[SKIP] exit-intent handled (flat/closed)")
         return True
 
