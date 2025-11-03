@@ -6,7 +6,7 @@
 # - 심볼 누락 시 NAS100 계열(US100/USTEC) 자동 탐색
 # - FIXED_ENTRY_LOT는 스텝에 '올림(ceil)'으로 맞춰 최소 지정 랏을 보장
 # - REQUIRE_MARGIN_CHECK=1 이면 마진 부족 시 스텝 단위로 낮춤
-# - ★ NO_MONEY(10019) 시 스텝 다운 재시도 + ★ split-entry(0.01씩 여러 번)로 목표 랏 충족
+# - NO_MONEY(10019) 시 스텝 다운 재시도 + split-entry로 목표 랏 충족
 # --------------------------------------------------------------------
 
 import os
@@ -19,20 +19,20 @@ from typing import Optional, Tuple, Dict, Any, List
 import requests
 import MetaTrader5 as mt5
 
-# ── HTTP resilient session (ADDED) ──────────────────────────────────────────
+# ── HTTP resilient session ────────────────────────────────────────────────
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 _http_retry = Retry(
-    total=5,                   # 최대 5회 재시도
-    backoff_factor=0.8,        # 지수 백오프 (0.8, 1.6, 2.4, …)
+    total=5,
+    backoff_factor=0.8,                # 0.8, 1.6, 2.4 …
     status_forcelist=[429, 502, 503, 504],
-    allowed_methods=["GET", "POST"]
+    allowed_methods=["GET", "POST"],
 )
 _http = requests.Session()
 _http.mount("http://",  HTTPAdapter(max_retries=_http_retry))
 _http.mount("https://", HTTPAdapter(max_retries=_http_retry))
-# ───────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────
 
 
 # ============== 환경변수 ==============
@@ -60,7 +60,7 @@ IGNORE_SIGNAL_CONTRACTS = os.environ.get("IGNORE_SIGNAL_CONTRACTS", "1").strip()
 
 
 # ===========================
-# 심볼 별칭 추가 (BTC + NAS + ETH)
+# 심볼 별칭 (BTC + NAS + ETH)
 # ===========================
 FINAL_ALIASES: Dict[str, List[str]] = {
     "NQ1!":   ["NAS100", "US100", "USTEC"],
@@ -73,7 +73,7 @@ FINAL_ALIASES: Dict[str, List[str]] = {
     "BTCUSD":  ["BTCUSD", "BTCUSDT", "BTCUSD.m", "BTCUSD.micro", "BTCUSD.a", "XBTUSD"],
     "BTCUSDT": ["BTCUSDT", "BTCUSD", "BTCUSD.m", "BTCUSD.micro", "XBTUSD"],
 
-    # Ethereum
+    # 이더리움
     "ETHUSD":  ["ETHUSD", "ETHUSDT", "ETHUSD.m", "ETHUSDmicro", "XETUSD", "XETHUSD"],
     "ETHUSDT": ["ETHUSDT", "ETHUSD", "XETUSD", "XETHUSD", "ETHUSD.m", "ETHUSDmicro"],
     "XETUSD":  ["XETUSD", "ETHUSD", "ETHUSDT", "ETHUSD.m", "ETHUSDmicro"],
@@ -117,19 +117,15 @@ def ensure_mt5_initialized() -> bool:
 
 
 def post_json(path: str, payload: dict, timeout: float = 20.0) -> dict:
-    """Render와 통신: 연결/타임아웃/5xx를 부드럽게 흡수."""
     url = f"{SERVER_URL}{path}"
     try:
         r = _http.post(url, json=payload, timeout=timeout, headers={"Connection": "keep-alive"})
         r.raise_for_status()
         return r.json()
-    except (requests.exceptions.ReadTimeout,
-            requests.exceptions.ConnectTimeout) as e:
+    except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectTimeout) as e:
         log(f"[WARN] post_json timeout {path}: {e}")
         return {}
-    except (requests.exceptions.ConnectionError,
-            requests.exceptions.ChunkedEncodingError,
-            requests.exceptions.HTTPError) as e:
+    except (requests.exceptions.ConnectionError, requests.exceptions.ChunkedEncodingError, requests.exceptions.HTTPError) as e:
         log(f"[WARN] post_json conn/http err {path}: {e}")
         return {}
     except Exception as e:
@@ -196,6 +192,7 @@ def detect_any_open_from_alias_pool() -> Optional[str]:
         if sym:
             return sym
     return None
+
 
 # ============== 보조 ==============
 def ceil_to_step(x: float, step: float) -> float:
@@ -324,7 +321,6 @@ def get_position(symbol: str) -> Tuple[str, float]:
 
 
 def _send_deal(symbol: str, side: str, volume: float) -> tuple:
-    """단일 DEAL 전송, (ok, retcode, comment) 반환."""
     info = mt5.symbol_info(symbol)
     if not info or not info.visible:
         mt5.symbol_select(symbol, True)
@@ -360,9 +356,9 @@ def send_market_order(symbol: str, side: str, lot: float) -> bool:
     step = (info and info.volume_step) or 0.01
     vol_min = (info and info.volume_min) or step
 
-    target = max(vol_min, lot)          # 목표 랏
-    attempt = target                    # 현재 시도 랏
-    filled = 0.0                        # 누적 체결 랏
+    target = max(vol_min, lot)
+    attempt = target
+    filled = 0.0
 
     # (1) 스텝 다운 재시도 루프
     while attempt >= vol_min:
@@ -379,7 +375,7 @@ def send_market_order(symbol: str, side: str, lot: float) -> bool:
             tg(f"⛔ ENTRY FAIL {symbol} ret={ret} {cmt}")
             return False
 
-    # (2) 목표 미달이고 split 허용이면, vol_min씩 추가 체결
+    # (2) split-entry로 목표 채우기
     if ALLOW_SPLIT_ENTRIES and filled < target:
         remain = round(target - filled, 10)
         while remain >= vol_min - 1e-12:
@@ -454,7 +450,7 @@ def _close_volume_by_tickets(symbol: str, side_now: str, vol_to_close: float) ->
     ttype = mt5.POSITION_TYPE_BUY if side_now == "long" else mt5.POSITION_TYPE_SELL
     poss = [p for p in (mt5.positions_get(symbol=symbol) or []) if p.type == ttype]
     if not poss:
-        log("[WARN] no positions to close")
+        log("[WARN] no positions to close]")
         return True
 
     info = mt5.symbol_info(symbol)
@@ -475,10 +471,10 @@ def _close_volume_by_tickets(symbol: str, side_now: str, vol_to_close: float) ->
         if qty <= 0:
             continue
         req = {
-            "action": mt5.TRADE_ACTION_DEAL,
+            "action": mt5.TRADE_ACTION_DEAL",
             "symbol": symbol,
             "type": (mt5.ORDER_TYPE_SELL if side_now == "long" else mt5.ORDER_TYPE_BUY),
-            "position": p.ticket,           # ← 티켓 지정: 신규반대 진입 방지
+            "position": p.ticket,    # 티켓 지정: 신규 반대진입 방지
             "volume": qty,
             "price": price,
             "deviation": 50,
@@ -638,7 +634,7 @@ def handle_signal(sig: dict) -> bool:
     # === STRICT 모드가 아닐 때
     if side_now == "flat":
         if action not in ("buy", "sell"):
-            log("[SKIP] unknown action for flat state")
+            log("[SKIP] unknown action for flat state]")
             return True
         desired_side = "buy" if action == "buy" else "sell"
         return send_market_order(mt5_symbol, desired_side, lot_base)
@@ -677,12 +673,21 @@ def poll_loop():
     tg("🤖 MT5 Agent started")
 
     import random
+    tick = 0
+    consec_fail = 0
+
     while True:
+        tick += 1
+        # 주기적 keep-alive
+        if tick % 100 == 0:
+            _ = get_health()
+
         try:
             res = post_json("/pull", {"agent_key": AGENT_KEY, "max_batch": MAX_BATCH})
             items = res.get("items") or []
             if not items:
-                time.sleep(POLL_INTERVAL_SEC + random.random()*0.7)  # 지터로 서버 부하 분산
+                time.sleep(POLL_INTERVAL_SEC + random.random()*0.7)
+                consec_fail = 0
                 continue
 
             ack_ids = []
@@ -700,8 +705,14 @@ def poll_loop():
 
             if ack_ids:
                 _ = post_json("/ack", {"agent_key": AGENT_KEY, "ids": ack_ids})
+            consec_fail = 0
         except Exception as e:
             log(f"[WARN] poll_loop exception: {e}")
+            consec_fail += 1
+            backoff = min(30.0, (1.5 ** consec_fail))   # 최대 30초
+            time.sleep(backoff)
+            continue
+
         time.sleep(POLL_INTERVAL_SEC)
 
 
