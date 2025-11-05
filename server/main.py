@@ -108,17 +108,22 @@ async def webhook(request: Request, authorization: Optional[str] = Header(None))
     TradingView가 호출.
     - 인증을 쓰고 싶으면 Render 환경변수에 AUTH_TOKEN을 넣고,
       헤더에 Authorization: Bearer <AUTH_TOKEN> 를 보내면 됨.
+    - (추가) 쿼리파라미터 ?auth=<AUTH_TOKEN> 또는 ?token=<AUTH_TOKEN> 도 허용.
     - 바디(JSON)는 그대로 큐에 저장되어 에이전트가 /pull로 가져가게 됨.
     """
     if AUTH_TOKEN:
         expected = f"Bearer {AUTH_TOKEN}"
-        if authorization != expected:
+        # 헤더 또는 쿼리파라미터 중 하나만 맞아도 통과
+        qs = dict(request.query_params)
+        header_ok = (authorization == expected)
+        query_ok  = (qs.get("auth") == AUTH_TOKEN) or (qs.get("token") == AUTH_TOKEN)
+        if not (header_ok or query_ok):
             raise HTTPException(401, "Unauthorized")
 
     try:
         data = await request.json()
     except Exception:
-        # 비JSON이면 raw body 텍스트로 저장
+        # 비JSON이면 raw body 그대로 저장
         data = {"raw": await request.body()}
 
     rid = insert_signal(data)
