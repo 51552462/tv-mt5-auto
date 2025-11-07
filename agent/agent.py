@@ -40,6 +40,9 @@ SERVER_URL = os.environ.get("SERVER_URL", "").rstrip("/")
 AGENT_KEY = os.environ.get("AGENT_KEY", "")
 FIXED_ENTRY_LOT = float(os.environ.get("FIXED_ENTRY_LOT", "0.01"))
 
+# ✅ TSoup 전략 전용 고정 랏(기본 0.03) — tsoup 신호에서만 우선 적용
+TSOUP_FIXED_LOT = float(os.environ.get("TSOUP_FIXED_LOT", "0.03"))
+
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
@@ -60,7 +63,7 @@ IGNORE_SIGNAL_CONTRACTS = os.environ.get("IGNORE_SIGNAL_CONTRACTS", "1").strip()
 
 
 # ===========================
-# 심볼 별칭 (BTC + NAS + ETH)
+# 심볼 별칭 (BTC + NAS + ETH) + 요청 심볼 추가
 # ===========================
 FINAL_ALIASES: Dict[str, List[str]] = {
     "NQ1!":   ["NAS100", "US100", "USTEC"],
@@ -77,6 +80,21 @@ FINAL_ALIASES: Dict[str, List[str]] = {
     "ETHUSD":  ["ETHUSD", "ETHUSDT", "ETHUSD.m", "ETHUSDmicro", "XETUSD", "XETHUSD"],
     "ETHUSDT": ["ETHUSDT", "ETHUSD", "XETUSD", "XETHUSD", "ETHUSD.m", "ETHUSDmicro"],
     "XETUSD":  ["XETUSD", "ETHUSD", "ETHUSDT", "ETHUSD.m", "ETHUSDmicro"],
+
+    # ====== 신규 추가 심볼 세트 ======
+    # WTI Crude
+    "CL-OIL": ["CL-OIL", "CL", "OIL", "WTI"],
+    # Gold / Silver
+    "XAUUSD": ["XAUUSD", "GOLD"],
+    "XAGUSD": ["XAGUSD", "SILVER"],
+    # Natural Gas
+    "NG": ["NG", "NATGAS", "GAS"],
+    # DAX / GER40
+    "GER40": ["GER40", "DAX", "DE40"],
+    # Russell 2000
+    "US2000": ["US2000", "RUSSELL", "RTY"],
+    # Dow Jones 30
+    "US30": ["US30", "DOW", "DJI"],
 }
 
 
@@ -529,6 +547,26 @@ def close_all_for_candidates(candidates: List[str]) -> bool:
     return True if anything or True else True
 
 
+# ============== TSoup 전략 식별 ==============
+TSOUP_ALERT_SET = {"buy signal", "sell signal", "take-profit signal", "stop-loss signal"}
+
+def is_tsoup_signal(sig: dict) -> bool:
+    # 명시 플래그
+    if str(sig.get("tsoup", "")).lower() in ("1", "true", "yes"):
+        return True
+    # 전략/타이틀 문자열
+    for k in ("strategy", "strategy_title", "title", "name"):
+        v = str(sig.get(k, "")).lower()
+        if ("turtle soup" in v) or ("tsoup" in v):
+            return True
+    # 메시지 패턴
+    for k in ("message", "alert_message"):
+        v = str(sig.get(k, "")).lower().strip()
+        if v in TSOUP_ALERT_SET:
+            return True
+    return False
+
+
 # ============== 시그널 처리 ==============
 EXIT_ACTIONS = {"close", "exit", "flat", "stop", "sl", "tp", "close_all"}
 
@@ -563,6 +601,9 @@ def handle_signal(sig: dict) -> bool:
 
     market_position = str(sig.get("market_position", "")).strip().lower()
 
+    # ✅ TSoup 신호면 고정 랏 0.03(환경변수 TSOUP_FIXED_LOT)을 우선 적용
+    base_lot_for_this_signal = TSOUP_FIXED_LOT if is_tsoup_signal(sig) else FIXED_ENTRY_LOT
+
     cand_syms = build_candidate_symbols(symbol_req) if symbol_req else []
     open_sym = detect_open_symbol_from_candidates(cand_syms) if cand_syms else detect_any_open_from_alias_pool()
     if open_sym:
@@ -570,12 +611,12 @@ def handle_signal(sig: dict) -> bool:
         info = mt5.symbol_info(mt5_symbol)
         step = (info and info.volume_step) or 0.01
         vol_min = (info and info.volume_min) or step
-        desired = max(vol_min, FIXED_ENTRY_LOT)
+        desired = max(vol_min, base_lot_for_this_signal)
         lot_base = ceil_to_step(desired, step)
-        log(f"[lot-base] resolved={mt5_symbol} step={step} min={vol_min} FIXED={FIXED_ENTRY_LOT} -> {lot_base}")
+        log(f"[lot-base] resolved={mt5_symbol} step={step} min={vol_min} BASE={base_lot_for_this_signal} -> {lot_base}")
     else:
         base_req = symbol_req if symbol_req else (DEFAULT_SYMBOL or "NAS100")
-        mt5_symbol, lot_base = pick_best_symbol_and_lot(base_req, FIXED_ENTRY_LOT)
+        mt5_symbol, lot_base = pick_best_symbol_and_lot(base_req, base_lot_for_this_signal)
         if not mt5_symbol:
             log(f"[ERR] tradable symbol not found for req={symbol_req}")
             return False
@@ -593,7 +634,6 @@ def handle_signal(sig: dict) -> bool:
         if s != "flat" and v > 0:
             close_by_opposites_if_any(mt5_symbol)
             return close_all(mt5_symbol)
-    # 처리 후 포지션이 없으면 True
         log("[SKIP] exit-intent handled (flat/closed)")
         return True
 
@@ -668,7 +708,7 @@ def handle_signal(sig: dict) -> bool:
 
 # ============== 폴링 루프 ==============
 def poll_loop():
-    log(f"env FIXED_ENTRY_LOT={FIXED_ENTRY_LOT} REQUIRE_MARGIN_CHECK={REQUIRE_MARGIN_CHECK} ALLOW_SPLIT_ENTRIES={ALLOW_SPLIT_ENTRIES}")
+    log(f"env FIXED_ENTRY_LOT={FIXED_ENTRY_LOT} TSOUP_FIXED_LOT={TSOUP_FIXED_LOT} REQUIRE_MARGIN_CHECK={REQUIRE_MARGIN_CHECK} ALLOW_SPLIT_ENTRIES={ALLOW_SPLIT_ENTRIES}")
     log(f"env STRICT_FIXED_MODE={STRICT_FIXED_MODE} PARTIAL_LOT={PARTIAL_LOT} DEFAULT_SYMBOL='{DEFAULT_SYMBOL}' IGNORE_SIGNAL_CONTRACTS={IGNORE_SIGNAL_CONTRACTS}")
     log(f"Agent start. server={SERVER_URL}")
     tg("🤖 MT5 Agent started")
