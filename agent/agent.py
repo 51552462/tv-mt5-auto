@@ -60,23 +60,61 @@ IGNORE_SIGNAL_CONTRACTS = os.environ.get("IGNORE_SIGNAL_CONTRACTS", "1").strip()
 
 
 # ===========================
-# 심볼 별칭 (BTC + NAS + ETH)
+# 심볼 별칭 (TV → INFINOX MT5)
+# ※ 여기만 보강: 나머지 코드는 업로드본 유지(:contentReference[oaicite:1]{index=1})
 # ===========================
 FINAL_ALIASES: Dict[str, List[str]] = {
+    # ── Nasdaq 계열 ──
     "NQ1!":   ["NAS100", "US100", "USTEC"],
     "NAS100": ["NAS100", "US100", "USTEC"],
     "US100":  ["US100", "NAS100", "USTEC"],
     "USTEC":  ["USTEC", "US100", "NAS100"],
-    "EURUSD": ["EURUSD", "EURUSD.m", "EURUSD.micro"],
 
-    # 비트코인
+    # ── 다우/러셀 ──
+    "YM1!":   ["US30", "DJI", "DOW", "US30.cash", "US30m"],
+    "RTY1!":  ["US2000", "RUSSELL", "RUS2000", "US2000.cash", "US2000m"],
+
+    # ── 독일 ──
+    "FDAX1!": ["GER40", "DE40", "DAX", "GER40.cash", "DE40.cash"],
+    "GER40":  ["GER40", "DE40", "DAX"],
+
+    # ── 일본 ──
+    "NI225":  ["JPN225", "JP225", "NIKKEI225", "J225", "JPN225.cash"],
+    "JPN225": ["JPN225", "JP225", "NI225", "JPN225.cash"],
+
+    # ── 홍콩 ──
+    "HSI1!":  ["HK50", "HSI", "HK50.cash", "HK50m"],
+
+    # ── 호주 ──
+    "ASX":    ["AUS200", "ASX200", "AU200", "AUS200.cash"],
+    "AUS200": ["AUS200", "ASX200", "AU200", "AUS200.cash"],
+
+    # ── 스페인 ──
+    "IBEX":   ["ESP35", "IBEX35", "ES35", "ESP35.cash"],
+    "ESP35":  ["ESP35", "IBEX35", "ES35"],
+
+    # ── 브라질 ──
+    "BVSPX":  ["BOVESPA", "IBOV", "IBOVESPA", "BVSPX"],
+
+    # ── 금/은/원유/가스 ──
+    "GC1!":   ["XAUUSD", "GOLD", "XAUUSD.cash", "XAUUSDm"],
+    "SI1!":   ["XAGUSD", "SILVER", "XAGUSD.cash", "XAGUSDm"],
+    "CL1!":   ["CL-OIL", "USOIL", "WTI", "OIL", "CL", "CLm"],
+    "NG1!":   ["NG", "NATGAS", "GAS", "NGm"],
+
+    # ── 현물 직접 매핑 ──
+    "XAUUSD": ["XAUUSD", "GOLD"],
+    "XAGUSD": ["XAGUSD", "SILVER"],
+
+    # ── 크립토 ──
     "BTCUSD":  ["BTCUSD", "BTCUSDT", "BTCUSD.m", "BTCUSD.micro", "BTCUSD.a", "XBTUSD"],
     "BTCUSDT": ["BTCUSDT", "BTCUSD", "BTCUSD.m", "BTCUSD.micro", "XBTUSD"],
-
-    # 이더리움
     "ETHUSD":  ["ETHUSD", "ETHUSDT", "ETHUSD.m", "ETHUSDmicro", "XETUSD", "XETHUSD"],
     "ETHUSDT": ["ETHUSDT", "ETHUSD", "XETUSD", "XETHUSD", "ETHUSD.m", "ETHUSDmicro"],
     "XETUSD":  ["XETUSD", "ETHUSD", "ETHUSDT", "ETHUSD.m", "ETHUSDmicro"],
+
+    # ── FX 예시(기존 포함) ──
+    "EURUSD": ["EURUSD", "EURUSD.m", "EURUSD.micro"],
 }
 
 
@@ -143,7 +181,7 @@ def get_health() -> dict:
 
 
 # ===========================
-# 심볼 탐색  ← ★ 수정: .crp 등 변형을 끝순위로
+# 심볼 탐색
 # ===========================
 def build_candidate_symbols(requested_symbol: str) -> List[str]:
     req = (requested_symbol or "").strip()
@@ -152,43 +190,25 @@ def build_candidate_symbols(requested_symbol: str) -> List[str]:
     req_l = req.lower()
     all_syms = mt5.symbols_get() or []
 
-    # 1) 정확히 같은 이름
     exact = [s.name for s in all_syms if s.name.lower() == req_l]
-
-    # 2) 부분 일치(요청 문자열이 포함된 심볼)
     partial = []
     if not exact:
         for s in all_syms:
             if req_l in s.name.lower():
                 partial.append(s.name)
 
-    # 3) 별칭들 중 '정확히 같은 이름' 우선
+    alias_partials = []
     aliases = FINAL_ALIASES.get(req.upper(), [])
-    alias_exact = []
-    alias_partial = []
     for al in aliases:
         al_l = al.lower()
         for s in all_syms:
             nm = s.name.lower()
-            if nm == al_l:
-                alias_exact.append(s.name)
-            elif al_l in nm:
-                alias_partial.append(s.name)
+            if nm == al_l or al_l in nm:
+                alias_partials.append(s.name)
 
-    # 4) 정렬: .crp 같은 변형은 맨 뒤로 (가끔 브로커가 비활성/테스트용으로 둠)
-    ordered = exact + alias_exact + partial + alias_partial
+    ordered = exact + partial + alias_partials
     seen = set()
-    ordered = [x for x in ordered if not (x in seen or seen.add(x))]
-
-    # 우선순위: 점(.) 없는 심볼 > .m/.micro 등 일반 변형 > .crp 같은 특수 변형
-    def rank(name: str) -> tuple:
-        n = name.lower()
-        bad = (".crp" in n or ".test" in n or ".demo" in n)
-        dotted = ("." in n)
-        return (bad, dotted, len(n))  # bad=True면 뒤로, 그다음 dotted, 마지막 길이
-
-    ordered.sort(key=rank)
-    return ordered
+    return [x for x in ordered if not (x in seen or seen.add(x))]
 
 
 def detect_open_symbol_from_candidates(candidates: List[str]) -> Optional[str]:
@@ -297,15 +317,6 @@ def pick_best_symbol_and_lot(requested_symbol: str, base_lot: float) -> Tuple[Op
 
     seen = set()
     cand = [x for x in cand if not (x in seen or seen.add(x))]
-
-    # ★ 여기서도 동일 기준으로 정렬
-    def rank(name: str) -> tuple:
-        n = name.lower()
-        bad = (".crp" in n or ".test" in n or ".demo" in n)
-        dotted = ("." in n)
-        return (bad, dotted, len(n))
-
-    cand.sort(key=rank)
 
     for sym in cand:
         info = mt5.symbol_info(sym)
