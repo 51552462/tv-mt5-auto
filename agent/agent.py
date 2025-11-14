@@ -61,7 +61,6 @@ IGNORE_SIGNAL_CONTRACTS = os.environ.get("IGNORE_SIGNAL_CONTRACTS", "1").strip()
 
 # ===========================
 # 심볼 별칭 (TV → INFINOX MT5)
-# ※ 여기만 보강: 나머지 코드는 업로드본 유지(:contentReference[oaicite:1]{index=1})
 # ===========================
 FINAL_ALIASES: Dict[str, List[str]] = {
     # ── Nasdaq 계열 ──
@@ -113,9 +112,12 @@ FINAL_ALIASES: Dict[str, List[str]] = {
     "ETHUSDT": ["ETHUSDT", "ETHUSD", "XETUSD", "XETHUSD", "ETHUSD.m", "ETHUSDmicro"],
     "XETUSD":  ["XETUSD", "ETHUSD", "ETHUSDT", "ETHUSD.m", "ETHUSDmicro"],
 
-    # ── FX 예시(기존 포함) ──
+    # ── FX 예시 ──
     "EURUSD": ["EURUSD", "EURUSD.m", "EURUSD.micro"],
 }
+
+# TradingView 기준 마지막 pos_after (심볼별)
+LAST_TV_POS: Dict[str, Optional[float]] = {}
 
 
 # ===========================
@@ -570,6 +572,7 @@ def close_all_for_candidates(candidates: List[str]) -> bool:
 # ============== 시그널 처리 ==============
 EXIT_ACTIONS = {"close", "exit", "flat", "stop", "sl", "tp", "close_all"}
 
+
 def _read_symbol_from_signal(sig: dict) -> str:
     for k in ["symbol", "sym", "ticker", "SYMBOL", "Symbol", "s"]:
         v = sig.get(k)
@@ -601,6 +604,25 @@ def handle_signal(sig: dict) -> bool:
 
     market_position = str(sig.get("market_position", "")).strip().lower()
 
+    # ── TV 기준 포지션 변화 유형 계산 ─────────────────────
+    symbol_key = (symbol_req or "").strip().upper()
+    prev_pos = LAST_TV_POS.get(symbol_key) if symbol_key else None
+    position_change = "unknown"
+    if symbol_key and pos_after is not None:
+        if prev_pos is None:
+            position_change = "first"
+        else:
+            if abs(pos_after - prev_pos) < 1e-9:
+                position_change = "same"
+            elif abs(pos_after) > abs(prev_pos):
+                position_change = "increase"
+            else:
+                position_change = "decrease"
+    # 현재 신호를 기준으로 상태 업데이트(이후 신호 비교용)
+    if symbol_key and pos_after is not None:
+        LAST_TV_POS[symbol_key] = pos_after
+    # ────────────────────────────────────────────────────
+
     cand_syms = build_candidate_symbols(symbol_req) if symbol_req else []
     open_sym = detect_open_symbol_from_candidates(cand_syms) if cand_syms else detect_any_open_from_alias_pool()
     if open_sym:
@@ -619,8 +641,11 @@ def handle_signal(sig: dict) -> bool:
             return False
 
     side_now, vol_now = get_position(mt5_symbol)
-    log(f"[state] req={symbol_req} resolved={mt5_symbol}: now={side_now} {vol_now}lot, "
-        f"action={action}, market_pos={market_position}, pos_after={pos_after}, contracts={contracts}, STRICT={STRICT_FIXED_MODE}")
+    log(
+        f"[state] req={symbol_req} resolved={mt5_symbol}: now={side_now} {vol_now}lot, "
+        f"action={action}, market_pos={market_position}, pos_after={pos_after}, "
+        f"contracts={contracts}, STRICT={STRICT_FIXED_MODE}, TV_change={position_change}"
+    )
 
     # === 전량 종료 의도 ===
     exit_intent = (market_position == "flat") or (action in EXIT_ACTIONS) or (pos_after == 0)
@@ -641,6 +666,15 @@ def handle_signal(sig: dict) -> bool:
         partial_lot = PARTIAL_LOT if (PARTIAL_LOT and PARTIAL_LOT > 0) else (FIXED_ENTRY_LOT if FIXED_ENTRY_LOT > 0 else step)
 
         if side_now == "flat":
+            # 보호 로직: 포지션이 없는데 TV 포지션이 줄어드는(decrease) 신호면 신규 진입 금지
+            if position_change == "decrease":
+                log("[SKIP] flat + decreasing TV position (STRICT) -> treat as exit-only; no new entry")
+                return True
+            # 첫 신호인데 이미 TV 포지션이 0이 아닌 경우도 동기화만 하고 스킵
+            if position_change == "first" and pos_after not in (None, 0):
+                log("[SKIP] first TV signal with non-zero pos_after while flat (STRICT) -> sync only")
+                return True
+
             if action not in ("buy", "sell"):
                 log("[SKIP] unknown action for flat state (STRICT)")
                 return True
@@ -671,6 +705,15 @@ def handle_signal(sig: dict) -> bool:
 
     # === STRICT 모드가 아닐 때
     if side_now == "flat":
+        # 보호 로직: 포지션이 없는데 TV 포지션이 줄어드는(decrease) 신호면 신규 진입 금지
+        if position_change == "decrease":
+            log("[SKIP] flat + decreasing TV position -> treat as exit-only; no new entry")
+            return True
+        # 첫 신호인데 이미 TV 포지션이 0이 아닌 경우: 동기화만 하고 스킵
+        if position_change == "first" and pos_after not in (None, 0):
+            log("[SKIP] first TV signal with non-zero pos_after while flat -> sync only")
+            return True
+
         if action not in ("buy", "sell"):
             log("[SKIP] unknown action for flat state]")
             return True
