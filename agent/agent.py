@@ -7,6 +7,7 @@
 # - FIXED_ENTRY_LOT는 스텝에 '올림(ceil)'으로 맞춰 최소 지정 랏을 보장
 # - REQUIRE_MARGIN_CHECK=1 이면 마진 부족 시 스텝 단위로 낮춤
 # - NO_MONEY(10019) 시 스텝 다운 재시도 + split-entry로 목표 랏 충족
+# - .crp 심볼은 전부 무시(BTCUSD.crp 등) → Trade disabled 방지
 # --------------------------------------------------------------------
 
 import os
@@ -25,14 +26,13 @@ from urllib3.util.retry import Retry
 
 _http_retry = Retry(
     total=5,
-    backoff_factor=0.8,                # 0.8, 1.6, 2.4 …
+    backoff_factor=0.8,
     status_forcelist=[429, 502, 503, 504],
     allowed_methods=["GET", "POST"],
 )
 _http = requests.Session()
 _http.mount("http://",  HTTPAdapter(max_retries=_http_retry))
 _http.mount("https://", HTTPAdapter(max_retries=_http_retry))
-# ─────────────────────────────────────────────────────────────────────────
 
 
 # ============== 환경변수 ==============
@@ -106,11 +106,11 @@ FINAL_ALIASES: Dict[str, List[str]] = {
     "XAGUSD": ["XAGUSD", "SILVER"],
 
     # ── 크립토 ──
-    "BTCUSD":  ["BTCUSD", "BTCUSDT", "BTCUSD.m", "BTCUSD.micro", "BTCUSD.a", "XBTUSD"],
-    "BTCUSDT": ["BTCUSDT", "BTCUSD", "BTCUSD.m", "BTCUSD.micro", "XBTUSD"],
-    "ETHUSD":  ["ETHUSD", "ETHUSDT", "ETHUSD.m", "ETHUSDmicro", "XETUSD", "XETHUSD"],
-    "ETHUSDT": ["ETHUSDT", "ETHUSD", "XETUSD", "XETHUSD", "ETHUSD.m", "ETHUSDmicro"],
-    "XETUSD":  ["XETUSD", "ETHUSD", "ETHUSDT", "ETHUSD.m", "ETHUSDmicro"],
+    "BTCUSD":  ["BTCUSD", "BTCUSDT", "XBTUSD"],
+    "BTCUSDT": ["BTCUSDT", "BTCUSD", "XBTUSD"],
+    "ETHUSD":  ["ETHUSD", "ETHUSDT", "XETUSD", "XETHUSD"],
+    "ETHUSDT": ["ETHUSDT", "ETHUSD", "XETUSD", "XETHUSD"],
+    "XETUSD":  ["XETUSD", "ETHUSD", "ETHUSDT"],
 
     # ── FX 예시 ──
     "EURUSD": ["EURUSD", "EURUSD.m", "EURUSD.micro"],
@@ -182,6 +182,12 @@ def get_health() -> dict:
         return {}
 
 
+# ============== 심볼 필터( .crp 차단 ) ==============
+def is_blocked_symbol(name: str) -> bool:
+    """BTCUSD.crp 같은 심볼은 여기서 막는다."""
+    return ".crp" in name.lower()
+
+
 # ===========================
 # 심볼 탐색
 # ===========================
@@ -191,6 +197,7 @@ def build_candidate_symbols(requested_symbol: str) -> List[str]:
         return []
     req_l = req.lower()
     all_syms = mt5.symbols_get() or []
+    all_syms = [s for s in all_syms if not is_blocked_symbol(s.name)]
 
     exact = [s.name for s in all_syms if s.name.lower() == req_l]
     partial = []
@@ -215,6 +222,8 @@ def build_candidate_symbols(requested_symbol: str) -> List[str]:
 
 def detect_open_symbol_from_candidates(candidates: List[str]) -> Optional[str]:
     for sym in candidates:
+        if is_blocked_symbol(sym):
+            continue
         poss = mt5.positions_get(symbol=sym)
         if poss and len(poss) > 0:
             return sym
@@ -299,7 +308,10 @@ def pick_best_symbol_and_lot(requested_symbol: str, base_lot: float) -> Tuple[Op
         req = requested_symbol
     req = req.strip()
     req_l = req.lower()
+
     all_syms = mt5.symbols_get() or []
+    all_syms = [s for s in all_syms if not is_blocked_symbol(s.name)]
+
     cand = []
 
     for s in all_syms:
@@ -383,11 +395,6 @@ def _send_deal(symbol: str, side: str, volume: float) -> tuple:
 
 
 def send_market_order(symbol: str, side: str, lot: float) -> bool:
-    """
-    1) lot 시도 → NO_MONEY면 step씩 줄여 재시도(최소 vol_min).
-    2) 최종 체결량이 목표 미달이고 ALLOW_SPLIT_ENTRIES=1 이면
-       vol_min씩 반복 체결하여 목표 lot까지 채운다.
-    """
     info = mt5.symbol_info(symbol)
     if not info or not info.visible:
         mt5.symbol_select(symbol, True)
@@ -400,7 +407,6 @@ def send_market_order(symbol: str, side: str, lot: float) -> bool:
     attempt = target
     filled = 0.0
 
-    # (1) 스텝 다운 재시도 루프
     while attempt >= vol_min:
         ok, ret, cmt = _send_deal(symbol, side, attempt)
         if ok:
@@ -415,7 +421,6 @@ def send_market_order(symbol: str, side: str, lot: float) -> bool:
             tg(f"⛔ ENTRY FAIL {symbol} ret={ret} {cmt}")
             return False
 
-    # (2) split-entry로 목표 채우기
     if ALLOW_SPLIT_ENTRIES and filled < target:
         remain = round(target - filled, 10)
         while remain >= vol_min - 1e-12:
@@ -514,7 +519,7 @@ def _close_volume_by_tickets(symbol: str, side_now: str, vol_to_close: float) ->
             "action": mt5.TRADE_ACTION_DEAL,
             "symbol": symbol,
             "type": (mt5.ORDER_TYPE_SELL if side_now == "long" else mt5.ORDER_TYPE_BUY),
-            "position": p.ticket,           # 티켓 지정: 신규 반대진입 방지
+            "position": p.ticket,
             "volume": qty,
             "price": price,
             "deviation": 50,
@@ -552,6 +557,8 @@ def close_all(symbol: str) -> bool:
 def close_all_for_candidates(candidates: List[str]) -> bool:
     anything = False
     for sym in candidates:
+        if is_blocked_symbol(sym):
+            continue
         poss = mt5.positions_get(symbol=sym)
         if not poss:
             continue
@@ -604,7 +611,7 @@ def handle_signal(sig: dict) -> bool:
 
     market_position = str(sig.get("market_position", "")).strip().lower()
 
-    # ── TV 기준 포지션 변화 유형 계산 ─────────────────────
+    # ── TV 기준 포지션 변화 유형 계산 ──
     symbol_key = (symbol_req or "").strip().upper()
     prev_pos = LAST_TV_POS.get(symbol_key) if symbol_key else None
     position_change = "unknown"
@@ -618,10 +625,8 @@ def handle_signal(sig: dict) -> bool:
                 position_change = "increase"
             else:
                 position_change = "decrease"
-    # 현재 신호를 기준으로 상태 업데이트(이후 신호 비교용)
     if symbol_key and pos_after is not None:
         LAST_TV_POS[symbol_key] = pos_after
-    # ────────────────────────────────────────────────────
 
     cand_syms = build_candidate_symbols(symbol_req) if symbol_req else []
     open_sym = detect_open_symbol_from_candidates(cand_syms) if cand_syms else detect_any_open_from_alias_pool()
@@ -666,11 +671,9 @@ def handle_signal(sig: dict) -> bool:
         partial_lot = PARTIAL_LOT if (PARTIAL_LOT and PARTIAL_LOT > 0) else (FIXED_ENTRY_LOT if FIXED_ENTRY_LOT > 0 else step)
 
         if side_now == "flat":
-            # 보호 로직: 포지션이 없는데 TV 포지션이 줄어드는(decrease) 신호면 신규 진입 금지
             if position_change == "decrease":
                 log("[SKIP] flat + decreasing TV position (STRICT) -> treat as exit-only; no new entry")
                 return True
-            # 첫 신호인데 이미 TV 포지션이 0이 아닌 경우도 동기화만 하고 스킵
             if position_change == "first" and pos_after not in (None, 0):
                 log("[SKIP] first TV signal with non-zero pos_after while flat (STRICT) -> sync only")
                 return True
@@ -703,13 +706,11 @@ def handle_signal(sig: dict) -> bool:
 
         return True
 
-    # === STRICT 모드가 아닐 때
+    # === STRICT 모드가 아닐 때 ===
     if side_now == "flat":
-        # 보호 로직: 포지션이 없는데 TV 포지션이 줄어드는(decrease) 신호면 신규 진입 금지
         if position_change == "decrease":
             log("[SKIP] flat + decreasing TV position -> treat as exit-only; no new entry")
             return True
-        # 첫 신호인데 이미 TV 포지션이 0이 아닌 경우: 동기화만 하고 스킵
         if position_change == "first" and pos_after not in (None, 0):
             log("[SKIP] first TV signal with non-zero pos_after while flat -> sync only")
             return True
@@ -759,7 +760,6 @@ def poll_loop():
 
     while True:
         tick += 1
-        # 주기적 keep-alive
         if tick % 100 == 0:
             _ = get_health()
 
@@ -790,7 +790,7 @@ def poll_loop():
         except Exception as e:
             log(f"[WARN] poll_loop exception: {e}")
             consec_fail += 1
-            backoff = min(30.0, (1.5 ** consec_fail))   # 최대 30초
+            backoff = min(30.0, (1.5 ** consec_fail))
             time.sleep(backoff)
             continue
 
