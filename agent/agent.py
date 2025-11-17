@@ -20,7 +20,6 @@ from typing import Optional, Tuple, Dict, Any, List
 import requests
 import MetaTrader5 as mt5
 
-# ── HTTP resilient session ────────────────────────────────────────────────
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -33,7 +32,6 @@ _http_retry = Retry(
 _http = requests.Session()
 _http.mount("http://",  HTTPAdapter(max_retries=_http_retry))
 _http.mount("https://", HTTPAdapter(max_retries=_http_retry))
-
 
 # ============== 환경변수 ==============
 SERVER_URL = os.environ.get("SERVER_URL", "").rstrip("/")
@@ -57,7 +55,6 @@ PARTIAL_LOT = os.environ.get("PARTIAL_LOT", "").strip()
 PARTIAL_LOT = float(PARTIAL_LOT) if PARTIAL_LOT else None
 
 IGNORE_SIGNAL_CONTRACTS = os.environ.get("IGNORE_SIGNAL_CONTRACTS", "1").strip() in ("1","true","True","YES","yes")
-
 
 # ===========================
 # 심볼 별칭 (TV → INFINOX MT5)
@@ -119,13 +116,11 @@ FINAL_ALIASES: Dict[str, List[str]] = {
 # TradingView 기준 마지막 pos_after (심볼별)
 LAST_TV_POS: Dict[str, Optional[float]] = {}
 
-
 # ===========================
 # 기본 함수 / 유틸
 # ===========================
 def log(msg: str):
     print(time.strftime("[%Y-%m-%d %H:%M:%S]"), msg, flush=True)
-
 
 def tg(message: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -138,7 +133,6 @@ def tg(message: str):
         )
     except Exception as e:
         print("[TG ERR]", e, flush=True)
-
 
 def ensure_mt5_initialized() -> bool:
     try:
@@ -154,7 +148,6 @@ def ensure_mt5_initialized() -> bool:
     except Exception:
         log("[ERR] MT5 initialize exception:\n" + traceback.format_exc())
         return False
-
 
 def post_json(path: str, payload: dict, timeout: float = 20.0) -> dict:
     url = f"{SERVER_URL}{path}"
@@ -172,7 +165,6 @@ def post_json(path: str, payload: dict, timeout: float = 20.0) -> dict:
         log(f"[ERR] post_json fatal {path}: {e}")
         return {}
 
-
 def get_health() -> dict:
     try:
         r = _http.get(f"{SERVER_URL}/health", timeout=5)
@@ -181,12 +173,10 @@ def get_health() -> dict:
     except Exception:
         return {}
 
-
 # ============== 심볼 필터( .crp 차단 ) ==============
 def is_blocked_symbol(name: str) -> bool:
     """BTCUSD.crp 같은 심볼은 여기서 막는다."""
     return ".crp" in name.lower()
-
 
 # ===========================
 # 심볼 탐색
@@ -219,7 +209,6 @@ def build_candidate_symbols(requested_symbol: str) -> List[str]:
     seen = set()
     return [x for x in ordered if not (x in seen or seen.add(x))]
 
-
 def detect_open_symbol_from_candidates(candidates: List[str]) -> Optional[str]:
     for sym in candidates:
         if is_blocked_symbol(sym):
@@ -228,7 +217,6 @@ def detect_open_symbol_from_candidates(candidates: List[str]) -> Optional[str]:
         if poss and len(poss) > 0:
             return sym
     return None
-
 
 def detect_any_open_from_alias_pool() -> Optional[str]:
     bases = []
@@ -242,19 +230,16 @@ def detect_any_open_from_alias_pool() -> Optional[str]:
             return sym
     return None
 
-
 # ============== 보조 ==============
 def ceil_to_step(x: float, step: float) -> float:
     if step <= 0:
         return x
     return math.ceil(x / step) * step
 
-
 def floor_to_step(x: float, step: float) -> float:
     if step <= 0:
         return x
     return math.floor(x / step) * step
-
 
 # ============== 랏 결정 ==============
 def _decide_lot_no_margin(info, base_lot: float) -> float:
@@ -269,7 +254,6 @@ def _decide_lot_no_margin(info, base_lot: float) -> float:
         lot = floor_to_step(vol_max, step)
 
     return max(vol_min, lot)
-
 
 def _decide_lot_with_margin(symbol: str, info, base_lot: float) -> float:
     step = info.volume_step or 0.01
@@ -299,7 +283,6 @@ def _decide_lot_with_margin(symbol: str, info, base_lot: float) -> float:
         test = round(floor_to_step(test - step, step), 10)
 
     return max(vol_min, test)
-
 
 def pick_best_symbol_and_lot(requested_symbol: str, base_lot: float) -> Tuple[Optional[str], Optional[float]]:
     if not requested_symbol:
@@ -354,7 +337,6 @@ def pick_best_symbol_and_lot(requested_symbol: str, base_lot: float) -> Tuple[Op
 
     return None, None
 
-
 # ============== 포지션/주문 ==============
 def get_position(symbol: str) -> Tuple[str, float]:
     poss = mt5.positions_get(symbol=symbol)
@@ -370,7 +352,6 @@ def get_position(symbol: str) -> Tuple[str, float]:
     if abs(net) < 1e-9:
         return "flat", 0.0
     return ("long" if net > 0 else "short"), abs(net)
-
 
 def _send_deal(symbol: str, side: str, volume: float) -> tuple:
     info = mt5.symbol_info(symbol)
@@ -392,7 +373,6 @@ def _send_deal(symbol: str, side: str, volume: float) -> tuple:
     if r and r.retcode == mt5.TRADE_RETCODE_DONE:
         return True, r.retcode, getattr(r, "comment", "")
     return False, getattr(r, "retcode", None), getattr(r, "comment", "")
-
 
 def send_market_order(symbol: str, side: str, lot: float) -> bool:
     info = mt5.symbol_info(symbol)
@@ -443,7 +423,6 @@ def send_market_order(symbol: str, side: str, lot: float) -> bool:
     tg(f"⛔ ENTRY FAIL {symbol}")
     return False
 
-
 # ============== CLOSE_BY/청산 ==============
 def close_by_opposites_if_any(symbol: str) -> bool:
     poss = mt5.positions_get(symbol=symbol) or []
@@ -487,7 +466,6 @@ def close_by_opposites_if_any(symbol: str) -> bool:
                 ok = False
                 log(f"[ERR] CLOSE_BY ret={getattr(r,'retcode',None)} {getattr(r,'comment','')}")
     return ok
-
 
 def _close_volume_by_tickets(symbol: str, side_now: str, vol_to_close: float) -> bool:
     if vol_to_close <= 0:
@@ -534,7 +512,6 @@ def _close_volume_by_tickets(symbol: str, side_now: str, vol_to_close: float) ->
             log(f"[ERR] close ticket={p.ticket} ret={getattr(r,'retcode',None)} {getattr(r,'comment','')}")
     return ok
 
-
 def close_partial(symbol: str, side_now: str, lot_close: float) -> bool:
     if lot_close <= 0:
         return True
@@ -542,7 +519,6 @@ def close_partial(symbol: str, side_now: str, lot_close: float) -> bool:
     if ok:
         tg(f"🔻 PARTIAL {side_now.upper()} -{lot_close} {symbol}")
     return ok
-
 
 def close_all(symbol: str) -> bool:
     side_now, vol = get_position(symbol)
@@ -552,7 +528,6 @@ def close_all(symbol: str) -> bool:
     if ok:
         tg(f"🧹 CLOSE ALL {symbol}")
     return ok
-
 
 def close_all_for_candidates(candidates: List[str]) -> bool:
     anything = False
@@ -575,10 +550,8 @@ def close_all_for_candidates(candidates: List[str]) -> bool:
             log("[WARN] close_all error:\n" + traceback.format_exc())
     return True if anything or True else True
 
-
 # ============== 시그널 처리 ==============
 EXIT_ACTIONS = {"close", "exit", "flat", "stop", "sl", "tp", "close_all"}
-
 
 def _read_symbol_from_signal(sig: dict) -> str:
     for k in ["symbol", "sym", "ticker", "SYMBOL", "Symbol", "s"]:
@@ -586,7 +559,6 @@ def _read_symbol_from_signal(sig: dict) -> str:
         if v:
             return str(v).strip()
     return ""
-
 
 def handle_signal(sig: dict) -> bool:
     symbol_req = _read_symbol_from_signal(sig)
@@ -611,7 +583,6 @@ def handle_signal(sig: dict) -> bool:
 
     market_position = str(sig.get("market_position", "")).strip().lower()
 
-    # ── TV 기준 포지션 변화 유형 계산 ──
     symbol_key = (symbol_req or "").strip().upper()
     prev_pos = LAST_TV_POS.get(symbol_key) if symbol_key else None
     position_change = "unknown"
@@ -651,6 +622,15 @@ def handle_signal(sig: dict) -> bool:
         f"action={action}, market_pos={market_position}, pos_after={pos_after}, "
         f"contracts={contracts}, STRICT={STRICT_FIXED_MODE}, TV_change={position_change}"
     )
+
+    # === 보호: 계좌는 플랫인데 TV는 반대 포지션 청산 방향을 지시하는 경우 ===
+    if side_now == "flat":
+        if action == "buy" and market_position == "short":
+            log("[SKIP] flat account + TV buy on short position -> treat as exit-only; skip")
+            return True
+        if action == "sell" and market_position == "long":
+            log("[SKIP] flat account + TV sell on long position -> treat as exit-only; skip")
+            return True
 
     # === 전량 종료 의도 ===
     exit_intent = (market_position == "flat") or (action in EXIT_ACTIONS) or (pos_after == 0)
@@ -746,7 +726,6 @@ def handle_signal(sig: dict) -> bool:
     log("[SKIP] same-direction or unsupported signal; no action taken")
     return True
 
-
 # ============== 폴링 루프 ==============
 def poll_loop():
     log(f"env FIXED_ENTRY_LOT={FIXED_ENTRY_LOT} REQUIRE_MARGIN_CHECK={REQUIRE_MARGIN_CHECK} ALLOW_SPLIT_ENTRIES={ALLOW_SPLIT_ENTRIES}")
@@ -796,7 +775,6 @@ def poll_loop():
 
         time.sleep(POLL_INTERVAL_SEC)
 
-
 # ============== main ==============
 def main():
     if not SERVER_URL or not AGENT_KEY:
@@ -806,7 +784,6 @@ def main():
         return
     log(f"server health: {json.dumps(get_health())}")
     poll_loop()
-
 
 if __name__ == "__main__":
     main()
