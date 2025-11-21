@@ -8,7 +8,6 @@
 # - REQUIRE_MARGIN_CHECK=1 이면 마진 부족 시 스텝 단위로 낮춤
 # - NO_MONEY(10019) 시 스텝 다운 재시도 + split-entry로 목표 랏 충족
 # - .crp 심볼은 전부 무시(BTCUSD.crp 등) → Trade disabled 방지
-# - LONG_STOP_LOSS_PCT: 롱 포지션 -X% 시 전량 종료
 # --------------------------------------------------------------------
 
 import os
@@ -45,21 +44,17 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 POLL_INTERVAL_SEC = float(os.environ.get("POLL_INTERVAL_SEC", "1.0"))
 MAX_BATCH = int(os.environ.get("MAX_BATCH", "10"))
 
-REQUIRE_MARGIN_CHECK = os.environ.get("REQUIRE_MARGIN_CHECK", "0").strip() in ("1", "true", "True", "YES", "yes")
-ALLOW_SPLIT_ENTRIES = os.environ.get("ALLOW_SPLIT_ENTRIES", "1").strip() in ("1", "true", "True", "YES", "yes")
+REQUIRE_MARGIN_CHECK = os.environ.get("REQUIRE_MARGIN_CHECK", "0").strip() in ("1","true","True","YES","yes")
+ALLOW_SPLIT_ENTRIES = os.environ.get("ALLOW_SPLIT_ENTRIES", "1").strip() in ("1","true","True","YES","yes")
 
 DEFAULT_SYMBOL = os.environ.get("DEFAULT_SYMBOL", "").strip()
 
-STRICT_FIXED_MODE = os.environ.get("STRICT_FIXED_MODE", "0").strip() in ("1", "true", "True", "YES", "yes")
+STRICT_FIXED_MODE = os.environ.get("STRICT_FIXED_MODE", "0").strip() in ("1","true","True","YES","yes")
 
 PARTIAL_LOT = os.environ.get("PARTIAL_LOT", "").strip()
 PARTIAL_LOT = float(PARTIAL_LOT) if PARTIAL_LOT else None
 
-IGNORE_SIGNAL_CONTRACTS = os.environ.get("IGNORE_SIGNAL_CONTRACTS", "1").strip() in ("1", "true", "True", "YES", "yes")
-
-# 롱 손절 퍼센트 (양수값): 예) 1.0 → -1%에서 손절
-LONG_STOP_LOSS_PCT = float(os.environ.get("LONG_STOP_LOSS_PCT", "1.0"))
-
+IGNORE_SIGNAL_CONTRACTS = os.environ.get("IGNORE_SIGNAL_CONTRACTS", "1").strip() in ("1","true","True","YES","yes")
 
 # ===========================
 # 심볼 별칭 (TV → INFINOX MT5)
@@ -121,31 +116,11 @@ FINAL_ALIASES: Dict[str, List[str]] = {
 # TradingView 기준 마지막 pos_after (심볼별)
 LAST_TV_POS: Dict[str, Optional[float]] = {}
 
-
-# ===========================
-# 금/은 전용 기본 랏 결정
-# ===========================
-def get_base_lot_for_symbol(requested_symbol: str, mt5_symbol: str = "") -> float:
-    """
-    - 기본값: FIXED_ENTRY_LOT (예: 0.3)
-    - 금/은 계열(XAU, XAG, GC1!, SI1!)일 때만 0.03 사용
-    """
-    key_req = (requested_symbol or "").upper()
-    key_mt5 = (mt5_symbol or "").upper()
-    text = f"{key_req} {key_mt5}"
-
-    if "XAU" in text or "XAG" in text or "GC1!" in key_req or "SI1!" in key_req:
-        return 0.03
-
-    return FIXED_ENTRY_LOT
-
-
 # ===========================
 # 기본 함수 / 유틸
 # ===========================
 def log(msg: str):
     print(time.strftime("[%Y-%m-%d %H:%M:%S]"), msg, flush=True)
-
 
 def tg(message: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -158,7 +133,6 @@ def tg(message: str):
         )
     except Exception as e:
         print("[TG ERR]", e, flush=True)
-
 
 def ensure_mt5_initialized() -> bool:
     try:
@@ -174,7 +148,6 @@ def ensure_mt5_initialized() -> bool:
     except Exception:
         log("[ERR] MT5 initialize exception:\n" + traceback.format_exc())
         return False
-
 
 def post_json(path: str, payload: dict, timeout: float = 20.0) -> dict:
     url = f"{SERVER_URL}{path}"
@@ -192,7 +165,6 @@ def post_json(path: str, payload: dict, timeout: float = 20.0) -> dict:
         log(f"[ERR] post_json fatal {path}: {e}")
         return {}
 
-
 def get_health() -> dict:
     try:
         r = _http.get(f"{SERVER_URL}/health", timeout=5)
@@ -201,12 +173,10 @@ def get_health() -> dict:
     except Exception:
         return {}
 
-
 # ============== 심볼 필터( .crp 차단 ) ==============
 def is_blocked_symbol(name: str) -> bool:
     """BTCUSD.crp 같은 심볼은 여기서 막는다."""
     return ".crp" in name.lower()
-
 
 # ===========================
 # 심볼 탐색
@@ -239,7 +209,6 @@ def build_candidate_symbols(requested_symbol: str) -> List[str]:
     seen = set()
     return [x for x in ordered if not (x in seen or seen.add(x))]
 
-
 def detect_open_symbol_from_candidates(candidates: List[str]) -> Optional[str]:
     for sym in candidates:
         if is_blocked_symbol(sym):
@@ -248,7 +217,6 @@ def detect_open_symbol_from_candidates(candidates: List[str]) -> Optional[str]:
         if poss and len(poss) > 0:
             return sym
     return None
-
 
 def detect_any_open_from_alias_pool() -> Optional[str]:
     bases = []
@@ -262,19 +230,16 @@ def detect_any_open_from_alias_pool() -> Optional[str]:
             return sym
     return None
 
-
 # ============== 보조 ==============
 def ceil_to_step(x: float, step: float) -> float:
     if step <= 0:
         return x
     return math.ceil(x / step) * step
 
-
 def floor_to_step(x: float, step: float) -> float:
     if step <= 0:
         return x
     return math.floor(x / step) * step
-
 
 # ============== 랏 결정 ==============
 def _decide_lot_no_margin(info, base_lot: float) -> float:
@@ -289,7 +254,6 @@ def _decide_lot_no_margin(info, base_lot: float) -> float:
         lot = floor_to_step(vol_max, step)
 
     return max(vol_min, lot)
-
 
 def _decide_lot_with_margin(symbol: str, info, base_lot: float) -> float:
     step = info.volume_step or 0.01
@@ -319,7 +283,6 @@ def _decide_lot_with_margin(symbol: str, info, base_lot: float) -> float:
         test = round(floor_to_step(test - step, step), 10)
 
     return max(vol_min, test)
-
 
 def pick_best_symbol_and_lot(requested_symbol: str, base_lot: float) -> Tuple[Optional[str], Optional[float]]:
     if not requested_symbol:
@@ -365,7 +328,7 @@ def pick_best_symbol_and_lot(requested_symbol: str, base_lot: float) -> Tuple[Op
         if REQUIRE_MARGIN_CHECK:
             lot = _decide_lot_with_margin(sym, info, base_lot)
         else:
-            lot = _decide_lot_no_margin(info, base_lot)
+            lot = _decide_lot_no_margin(sym, info, base_lot)
 
         step = info.volume_step or 0.01
         vol_min = info.volume_min or step
@@ -373,7 +336,6 @@ def pick_best_symbol_and_lot(requested_symbol: str, base_lot: float) -> Tuple[Op
         return sym, lot
 
     return None, None
-
 
 # ============== 포지션/주문 ==============
 def get_position(symbol: str) -> Tuple[str, float]:
@@ -390,7 +352,6 @@ def get_position(symbol: str) -> Tuple[str, float]:
     if abs(net) < 1e-9:
         return "flat", 0.0
     return ("long" if net > 0 else "short"), abs(net)
-
 
 def _send_deal(symbol: str, side: str, volume: float) -> tuple:
     info = mt5.symbol_info(symbol)
@@ -412,7 +373,6 @@ def _send_deal(symbol: str, side: str, volume: float) -> tuple:
     if r and r.retcode == mt5.TRADE_RETCODE_DONE:
         return True, r.retcode, getattr(r, "comment", "")
     return False, getattr(r, "retcode", None), getattr(r, "comment", "")
-
 
 def send_market_order(symbol: str, side: str, lot: float) -> bool:
     info = mt5.symbol_info(symbol)
@@ -463,7 +423,6 @@ def send_market_order(symbol: str, side: str, lot: float) -> bool:
     tg(f"⛔ ENTRY FAIL {symbol}")
     return False
 
-
 # ============== CLOSE_BY/청산 ==============
 def close_by_opposites_if_any(symbol: str) -> bool:
     poss = mt5.positions_get(symbol=symbol) or []
@@ -505,9 +464,8 @@ def close_by_opposites_if_any(symbol: str) -> bool:
                 s.volume = round(s.volume - qty, 10)
             else:
                 ok = False
-                log(f"[ERR] CLOSE_BY ret={getattr(r, 'retcode', None)} {getattr(r, 'comment', '')}")
+                log(f"[ERR] CLOSE_BY ret={getattr(r,'retcode',None)} {getattr(r,'comment','')}")
     return ok
-
 
 def _close_volume_by_tickets(symbol: str, side_now: str, vol_to_close: float) -> bool:
     if vol_to_close <= 0:
@@ -551,9 +509,8 @@ def _close_volume_by_tickets(symbol: str, side_now: str, vol_to_close: float) ->
             remain = round(remain - qty, 10)
         else:
             ok = False
-            log(f"[ERR] close ticket={p.ticket} ret={getattr(r, 'retcode', None)} {getattr(r, 'comment', '')}")
+            log(f"[ERR] close ticket={p.ticket} ret={getattr(r,'retcode',None)} {getattr(r,'comment','')}")
     return ok
-
 
 def close_partial(symbol: str, side_now: str, lot_close: float) -> bool:
     if lot_close <= 0:
@@ -563,7 +520,6 @@ def close_partial(symbol: str, side_now: str, lot_close: float) -> bool:
         tg(f"🔻 PARTIAL {side_now.upper()} -{lot_close} {symbol}")
     return ok
 
-
 def close_all(symbol: str) -> bool:
     side_now, vol = get_position(symbol)
     if side_now == "flat" or vol <= 0:
@@ -572,7 +528,6 @@ def close_all(symbol: str) -> bool:
     if ok:
         tg(f"🧹 CLOSE ALL {symbol}")
     return ok
-
 
 def close_all_for_candidates(candidates: List[str]) -> bool:
     anything = False
@@ -595,50 +550,8 @@ def close_all_for_candidates(candidates: List[str]) -> bool:
             log("[WARN] close_all error:\n" + traceback.format_exc())
     return True if anything or True else True
 
-
-# ============== 롱 포지션 -X% 손절 체크 ==============
-def check_long_stop_loss():
-    """롱 포지션이 LONG_STOP_LOSS_PCT 만큼 손실이면 해당 심볼 전량 종료."""
-    if LONG_STOP_LOSS_PCT <= 0:
-        return
-
-    poss = mt5.positions_get() or []
-    if not poss:
-        return
-
-    by_symbol: Dict[str, List[Any]] = {}
-    for p in poss:
-        # 롱 포지션만 대상
-        if p.type != mt5.POSITION_TYPE_BUY:
-            continue
-        by_symbol.setdefault(p.symbol, []).append(p)
-
-    for sym, plist in by_symbol.items():
-        total_vol = sum(p.volume for p in plist)
-        if total_vol <= 0:
-            continue
-
-        avg_price = sum(p.price_open * p.volume for p in plist) / total_vol
-        info = mt5.symbol_info(sym)
-        if not info:
-            continue
-
-        price = info.bid or info.last or 0.0
-        if price <= 0:
-            continue
-
-        change_pct = (price - avg_price) / avg_price * 100.0
-        if change_pct <= -LONG_STOP_LOSS_PCT:
-            log(f"[SL_LONG] {sym} avg={avg_price} now={price} change={change_pct:.2f}% <= -{LONG_STOP_LOSS_PCT}% -> CLOSE ALL")
-            try:
-                close_all(sym)
-            except Exception:
-                log("[ERR] stop-loss close_all exception:\n" + traceback.format_exc())
-
-
 # ============== 시그널 처리 ==============
 EXIT_ACTIONS = {"close", "exit", "flat", "stop", "sl", "tp", "close_all"}
-
 
 def _read_symbol_from_signal(sig: dict) -> str:
     for k in ["symbol", "sym", "ticker", "SYMBOL", "Symbol", "s"]:
@@ -646,7 +559,6 @@ def _read_symbol_from_signal(sig: dict) -> str:
         if v:
             return str(v).strip()
     return ""
-
 
 def handle_signal(sig: dict) -> bool:
     symbol_req = _read_symbol_from_signal(sig)
@@ -689,20 +601,17 @@ def handle_signal(sig: dict) -> bool:
 
     cand_syms = build_candidate_symbols(symbol_req) if symbol_req else []
     open_sym = detect_open_symbol_from_candidates(cand_syms) if cand_syms else detect_any_open_from_alias_pool()
-
-    base_lot_cfg = get_base_lot_for_symbol(symbol_req, open_sym or "")
-
     if open_sym:
         mt5_symbol = open_sym
         info = mt5.symbol_info(mt5_symbol)
         step = (info and info.volume_step) or 0.01
         vol_min = (info and info.volume_min) or step
-        desired = max(vol_min, base_lot_cfg)
+        desired = max(vol_min, FIXED_ENTRY_LOT)
         lot_base = ceil_to_step(desired, step)
-        log(f"[lot-base] resolved={mt5_symbol} step={step} min={vol_min} BASE={base_lot_cfg} GLOBAL_FIX={FIXED_ENTRY_LOT} -> {lot_base}")
+        log(f"[lot-base] resolved={mt5_symbol} step={step} min={vol_min} FIXED={FIXED_ENTRY_LOT} -> {lot_base}")
     else:
         base_req = symbol_req if symbol_req else (DEFAULT_SYMBOL or "NAS100")
-        mt5_symbol, lot_base = pick_best_symbol_and_lot(base_req, base_lot_cfg)
+        mt5_symbol, lot_base = pick_best_symbol_and_lot(base_req, FIXED_ENTRY_LOT)
         if not mt5_symbol:
             log(f"[ERR] tradable symbol not found for req={symbol_req}")
             return False
@@ -714,7 +623,7 @@ def handle_signal(sig: dict) -> bool:
         f"contracts={contracts}, STRICT={STRICT_FIXED_MODE}, TV_change={position_change}"
     )
 
-    # 계좌는 플랫인데 TV는 반대 포지션 청산 방향을 지시하는 경우 보호
+    # === 보호: 계좌는 플랫인데 TV는 반대 포지션 청산 방향을 지시하는 경우 ===
     if side_now == "flat":
         if action == "buy" and market_position == "short":
             log("[SKIP] flat account + TV buy on short position -> treat as exit-only; skip")
@@ -723,7 +632,7 @@ def handle_signal(sig: dict) -> bool:
             log("[SKIP] flat account + TV sell on long position -> treat as exit-only; skip")
             return True
 
-    # 전량 종료 의도
+    # === 전량 종료 의도 ===
     exit_intent = (market_position == "flat") or (action in EXIT_ACTIONS) or (pos_after == 0)
     if exit_intent:
         targets = cand_syms if cand_syms else build_candidate_symbols(mt5_symbol)
@@ -735,7 +644,7 @@ def handle_signal(sig: dict) -> bool:
         log("[SKIP] exit-intent handled (flat/closed)")
         return True
 
-    # STRICT_FIXED_MODE: 고정 랏/분할 랏만 사용
+    # === STRICT_FIXED_MODE: 고정 랏/분할 랏만 사용 ===
     if STRICT_FIXED_MODE:
         info = mt5.symbol_info(mt5_symbol)
         step = (info and info.volume_step) or 0.01
@@ -744,9 +653,6 @@ def handle_signal(sig: dict) -> bool:
         if side_now == "flat":
             if position_change == "decrease":
                 log("[SKIP] flat + decreasing TV position (STRICT) -> treat as exit-only; no new entry")
-                return True
-            if position_change == "first" and pos_after not in (None, 0):
-                log("[SKIP] first TV signal with non-zero pos_after while flat (STRICT) -> sync only")
                 return True
 
             if action not in ("buy", "sell"):
@@ -777,13 +683,10 @@ def handle_signal(sig: dict) -> bool:
 
         return True
 
-    # STRICT 모드가 아닐 때
+    # === STRICT 모드가 아닐 때 ===
     if side_now == "flat":
         if position_change == "decrease":
             log("[SKIP] flat + decreasing TV position -> treat as exit-only; no new entry")
-            return True
-        if position_change == "first" and pos_after not in (None, 0):
-            log("[SKIP] first TV signal with non-zero pos_after while flat -> sync only")
             return True
 
         if action not in ("buy", "sell"):
@@ -817,12 +720,10 @@ def handle_signal(sig: dict) -> bool:
     log("[SKIP] same-direction or unsupported signal; no action taken")
     return True
 
-
 # ============== 폴링 루프 ==============
 def poll_loop():
     log(f"env FIXED_ENTRY_LOT={FIXED_ENTRY_LOT} REQUIRE_MARGIN_CHECK={REQUIRE_MARGIN_CHECK} ALLOW_SPLIT_ENTRIES={ALLOW_SPLIT_ENTRIES}")
     log(f"env STRICT_FIXED_MODE={STRICT_FIXED_MODE} PARTIAL_LOT={PARTIAL_LOT} DEFAULT_SYMBOL='{DEFAULT_SYMBOL}' IGNORE_SIGNAL_CONTRACTS={IGNORE_SIGNAL_CONTRACTS}")
-    log(f"env LONG_STOP_LOSS_PCT={LONG_STOP_LOSS_PCT}")
     log(f"Agent start. server={SERVER_URL}")
     tg("🤖 MT5 Agent started")
 
@@ -839,12 +740,7 @@ def poll_loop():
             res = post_json("/pull", {"agent_key": AGENT_KEY, "max_batch": MAX_BATCH})
             items = res.get("items") or []
             if not items:
-                # 시그널이 없어도 손절 체크는 계속 돌아가게
-                try:
-                    check_long_stop_loss()
-                except Exception as e:
-                    log(f"[WARN] check_long_stop_loss exception: {e}\n" + traceback.format_exc())
-                time.sleep(POLL_INTERVAL_SEC + random.random() * 0.7)
+                time.sleep(POLL_INTERVAL_SEC + random.random()*0.7)
                 consec_fail = 0
                 continue
 
@@ -864,13 +760,6 @@ def poll_loop():
             if ack_ids:
                 _ = post_json("/ack", {"agent_key": AGENT_KEY, "ids": ack_ids})
             consec_fail = 0
-
-            # 시그널 처리 후에도 롱 손절 체크
-            try:
-                check_long_stop_loss()
-            except Exception as e:
-                log(f"[WARN] check_long_stop_loss exception: {e}\n" + traceback.format_exc())
-
         except Exception as e:
             log(f"[WARN] poll_loop exception: {e}")
             consec_fail += 1
@@ -879,7 +768,6 @@ def poll_loop():
             continue
 
         time.sleep(POLL_INTERVAL_SEC)
-
 
 # ============== main ==============
 def main():
@@ -890,7 +778,6 @@ def main():
         return
     log(f"server health: {json.dumps(get_health())}")
     poll_loop()
-
 
 if __name__ == "__main__":
     main()
