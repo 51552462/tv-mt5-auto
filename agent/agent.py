@@ -328,7 +328,8 @@ def pick_best_symbol_and_lot(requested_symbol: str, base_lot: float) -> Tuple[Op
         if REQUIRE_MARGIN_CHECK:
             lot = _decide_lot_with_margin(sym, info, base_lot)
         else:
-            lot = _decide_lot_no_margin(sym, info, base_lot)
+            # ★ 여기 한 줄만 수정: sym, info, base_lot → info, base_lot
+            lot = _decide_lot_no_margin(info, base_lot)
 
         step = info.volume_step or 0.01
         vol_min = info.volume_min or step
