@@ -56,6 +56,26 @@ PARTIAL_LOT = float(PARTIAL_LOT) if PARTIAL_LOT else None
 
 IGNORE_SIGNAL_CONTRACTS = os.environ.get("IGNORE_SIGNAL_CONTRACTS", "1").strip() in ("1","true","True","YES","yes")
 
+# --------------------------------------------------------------------
+# 심볼별 고정 랏 설정
+# - BTC : 0.03
+# - ETH : 3.0
+# - 나머지 : FIXED_ENTRY_LOT (예: 0.3)
+# --------------------------------------------------------------------
+def get_fixed_lot_for_symbol(symbol_hint: str) -> float:
+    key = (symbol_hint or "").strip().upper()
+
+    # 비트코인 계열
+    if key in ("BTCUSD", "BTCUSDT", "XBTUSD"):
+        return 0.03
+
+    # 이더리움 계열
+    if key in ("ETHUSD", "ETHUSDT", "XETUSD", "XETHUSD"):
+        return 3.0
+
+    # 그 외 심볼은 환경변수 FIXED_ENTRY_LOT 사용
+    return FIXED_ENTRY_LOT
+
 # ===========================
 # 심볼 별칭 (TV → INFINOX MT5)
 # ===========================
@@ -328,7 +348,6 @@ def pick_best_symbol_and_lot(requested_symbol: str, base_lot: float) -> Tuple[Op
         if REQUIRE_MARGIN_CHECK:
             lot = _decide_lot_with_margin(sym, info, base_lot)
         else:
-            # ★ 여기 한 줄만 수정: sym, info, base_lot → info, base_lot
             lot = _decide_lot_no_margin(info, base_lot)
 
         step = info.volume_step or 0.01
@@ -607,12 +626,15 @@ def handle_signal(sig: dict) -> bool:
         info = mt5.symbol_info(mt5_symbol)
         step = (info and info.volume_step) or 0.01
         vol_min = (info and info.volume_min) or step
-        desired = max(vol_min, FIXED_ENTRY_LOT)
+        base_hint = symbol_req or mt5_symbol
+        base_lot_conf = get_fixed_lot_for_symbol(base_hint)
+        desired = max(vol_min, base_lot_conf)
         lot_base = ceil_to_step(desired, step)
-        log(f"[lot-base] resolved={mt5_symbol} step={step} min={vol_min} FIXED={FIXED_ENTRY_LOT} -> {lot_base}")
+        log(f"[lot-base] resolved={mt5_symbol} step={step} min={vol_min} BASE={base_lot_conf} -> {lot_base}")
     else:
         base_req = symbol_req if symbol_req else (DEFAULT_SYMBOL or "NAS100")
-        mt5_symbol, lot_base = pick_best_symbol_and_lot(base_req, FIXED_ENTRY_LOT)
+        base_lot_conf = get_fixed_lot_for_symbol(base_req)
+        mt5_symbol, lot_base = pick_best_symbol_and_lot(base_req, base_lot_conf)
         if not mt5_symbol:
             log(f"[ERR] tradable symbol not found for req={symbol_req}")
             return False
