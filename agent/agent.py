@@ -60,7 +60,8 @@ IGNORE_SIGNAL_CONTRACTS = os.environ.get("IGNORE_SIGNAL_CONTRACTS", "1").strip()
 # 심볼별 고정 랏 설정
 # - BTC : 0.03
 # - ETH : 3.0
-# - 나머지 : FIXED_ENTRY_LOT (예: 0.3)
+# - SOL : 3.0
+# - 그 외 : FIXED_ENTRY_LOT (예: 0.3)
 # --------------------------------------------------------------------
 def get_fixed_lot_for_symbol(symbol_hint: str) -> float:
     key = (symbol_hint or "").strip().upper()
@@ -71,6 +72,10 @@ def get_fixed_lot_for_symbol(symbol_hint: str) -> float:
 
     # 이더리움 계열
     if key in ("ETHUSD", "ETHUSDT", "XETUSD", "XETHUSD"):
+        return 3.0
+
+    # 솔라나 계열
+    if key in ("SOLUSD", "SOLUSDT"):
         return 3.0
 
     # 그 외 심볼은 환경변수 FIXED_ENTRY_LOT 사용
@@ -123,11 +128,13 @@ FINAL_ALIASES: Dict[str, List[str]] = {
     "XAGUSD": ["XAGUSD", "SILVER"],
 
     # ── 크립토 ──
-    "BTCUSD":  ["BTCUSD", "BTCUSDT", "XBTUSD"],
-    "BTCUSDT": ["BTCUSDT", "BTCUSD", "XBTUSD"],
-    "ETHUSD":  ["ETHUSD", "ETHUSDT", "XETUSD", "XETHUSD"],
-    "ETHUSDT": ["ETHUSDT", "ETHUSD", "XETUSD", "XETHUSD"],
-    "XETUSD":  ["XETUSD", "ETHUSD", "ETHUSDT"],
+    "BTCUSD":   ["BTCUSD", "BTCUSDT", "XBTUSD"],
+    "BTCUSDT":  ["BTCUSDT", "BTCUSD", "XBTUSD"],
+    "ETHUSD":   ["ETHUSD", "ETHUSDT", "XETUSD", "XETHUSD"],
+    "ETHUSDT":  ["ETHUSDT", "ETHUSD", "XETUSD", "XETHUSD"],
+    "XETUSD":   ["XETUSD", "ETHUSD", "ETHUSDT"],
+    "SOLUSD":   ["SOLUSD", "SOLUSDT"],
+    "SOLUSDT":  ["SOLUSDT", "SOLUSD"],
 
     # ── FX 예시 ──
     "EURUSD": ["EURUSD", "EURUSD.m", "EURUSD.micro"],
