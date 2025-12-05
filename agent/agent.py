@@ -587,6 +587,19 @@ def _read_symbol_from_signal(sig: dict) -> str:
             return str(v).strip()
     return ""
 
+# 포지션 크기 기준 동적 분할 랏 (항상 대략 1/3)
+def dynamic_partial_lot(vol_now: float, step: float) -> float:
+    if vol_now <= 0:
+        return step
+    raw = vol_now / 3.0
+    # 스텝에 맞춰 내림
+    lot = floor_to_step(raw, step)
+    if lot < step:
+        lot = step
+    if lot > vol_now:
+        lot = vol_now
+    return lot
+
 def handle_signal(sig: dict) -> bool:
     symbol_req = _read_symbol_from_signal(sig)
     if not symbol_req and DEFAULT_SYMBOL:
@@ -725,12 +738,11 @@ def handle_signal(sig: dict) -> bool:
         desired_side = "buy" if action == "buy" else "sell"
         return send_market_order(mt5_symbol, desired_side, lot_base)
 
+    # ▼ 여기부터 일반 모드 분할 종료 로직(모든 종목 공통) ▼
     if side_now == "long" and action == "sell":
         info = mt5.symbol_info(mt5_symbol)
         step = (info and info.volume_step) or 0.01
-        base = (contracts or 0.0) + (pos_after or vol_now)
-        frac = (contracts or 0.0) / base if base > 0 else 1.0
-        lot_close = max(step, min(vol_now, math.floor((vol_now * frac) / step) * step))
+        lot_close = dynamic_partial_lot(vol_now, step)
         if lot_close <= 0:
             log("[INFO] calc close_qty <= 0 -> skip")
             return True
@@ -739,9 +751,7 @@ def handle_signal(sig: dict) -> bool:
     if side_now == "short" and action == "buy":
         info = mt5.symbol_info(mt5_symbol)
         step = (info and info.volume_step) or 0.01
-        base = (contracts or 0.0) + (pos_after or vol_now)
-        frac = (contracts or 0.0) / base if base > 0 else 1.0
-        lot_close = max(step, min(vol_now, math.floor((vol_now * frac) / step) * step))
+        lot_close = dynamic_partial_lot(vol_now, step)
         if lot_close <= 0:
             log("[INFO] calc close_qty <= 0 -> skip")
             return True
