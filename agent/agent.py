@@ -76,7 +76,11 @@ def get_fixed_lot_for_symbol(symbol_hint: str) -> float:
 
     # 솔라나 계열
     if key in ("SOLUSD", "SOLUSDT"):
-        return 3.0
+        return 0.3
+
+    if key in ("XAGUSD", "SILVER", "XAGUSD.cash", "XAGUSDm"):
+        return 0.3
+
 
     # 그 외 심볼은 환경변수 FIXED_ENTRY_LOT 사용
     return FIXED_ENTRY_LOT
@@ -821,3 +825,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
