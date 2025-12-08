@@ -44,23 +44,24 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 POLL_INTERVAL_SEC = float(os.environ.get("POLL_INTERVAL_SEC", "1.0"))
 MAX_BATCH = int(os.environ.get("MAX_BATCH", "10"))
 
-REQUIRE_MARGIN_CHECK = os.environ.get("REQUIRE_MARGIN_CHECK", "0").strip() in ("1","true","True","YES","yes")
-ALLOW_SPLIT_ENTRIES = os.environ.get("ALLOW_SPLIT_ENTRIES", "1").strip() in ("1","true","True","YES","yes")
+REQUIRE_MARGIN_CHECK = os.environ.get("REQUIRE_MARGIN_CHECK", "0").strip() in ("1", "true", "True", "YES", "yes")
+ALLOW_SPLIT_ENTRIES = os.environ.get("ALLOW_SPLIT_ENTRIES", "1").strip() in ("1", "true", "True", "YES", "yes")
 
 DEFAULT_SYMBOL = os.environ.get("DEFAULT_SYMBOL", "").strip()
 
-STRICT_FIXED_MODE = os.environ.get("STRICT_FIXED_MODE", "0").strip() in ("1","true","True","YES","yes")
+STRICT_FIXED_MODE = os.environ.get("STRICT_FIXED_MODE", "0").strip() in ("1", "true", "True", "YES", "yes")
 
 PARTIAL_LOT = os.environ.get("PARTIAL_LOT", "").strip()
 PARTIAL_LOT = float(PARTIAL_LOT) if PARTIAL_LOT else None
 
-IGNORE_SIGNAL_CONTRACTS = os.environ.get("IGNORE_SIGNAL_CONTRACTS", "1").strip() in ("1","true","True","YES","yes")
+IGNORE_SIGNAL_CONTRACTS = os.environ.get("IGNORE_SIGNAL_CONTRACTS", "1").strip() in ("1", "true", "True", "YES", "yes")
 
 # --------------------------------------------------------------------
 # 심볼별 고정 랏 설정
 # - BTC : 0.03
 # - ETH : 3.0
 # - SOL : 3.0
+# - SILVER(XAGUSD 계열) : 0.3
 # - 그 외 : FIXED_ENTRY_LOT (예: 0.3)
 # --------------------------------------------------------------------
 def get_fixed_lot_for_symbol(symbol_hint: str) -> float:
@@ -78,11 +79,25 @@ def get_fixed_lot_for_symbol(symbol_hint: str) -> float:
     if key in ("SOLUSD", "SOLUSDT"):
         return 0.3
 
-    if key in ("XAGUSD", "SILVER", "XAGUSD.cash", "XAGUSDm"):
+    # 실버(은)
+    if key in ("XAGUSD", "SILVER", "XAGUSD.CASH", "XAGUSDm"):
         return 0.3
 
+    if key in (["ADAUSD", "ADAUSDT"):
+        return 0.3
 
-    # 그 외 심볼은 환경변수 FIXED_ENTRY_LOT 사용
+    if key in ("DOGUSD", "DOGEUSDT"):
+        return 0.3
+
+    if key in ("NERUSD", "NEARUSDT"):
+        return 0.3
+
+    if key in ("GRTUSD", "GRTUSDT"):
+        return 0.3
+   
+    if key in ("ONEUSD", "ONEUSDT"):
+        return 0.3    
+  # 그 외 심볼은 환경변수 FIXED_ENTRY_LOT 사용
     return FIXED_ENTRY_LOT
 
 # ===========================
@@ -139,6 +154,18 @@ FINAL_ALIASES: Dict[str, List[str]] = {
     "XETUSD":   ["XETUSD", "ETHUSD", "ETHUSDT"],
     "SOLUSD":   ["SOLUSD", "SOLUSDT"],
     "SOLUSDT":  ["SOLUSDT", "SOLUSD"],
+
+    # ── 새로 추가한 알트코인들 ──
+    "ADAUSD":   ["ADAUSD", "ADAUSDT"],
+    "ADAUSDT":  ["ADAUSDT", "ADAUSD"],
+    "DOGUSD":   ["DOGUSD", "DOGEUSDT"],
+    "DOGEUSDT": ["DOGEUSDT", "DOGUSD"],
+    "NERUSD":   ["NERUSD", "NEARUSDT"],
+    "NEARUSDT": ["NEARUSDT", "NERUSD"],
+    "GRTUSD":   ["GRTUSD", "GRTUSDT"],
+    "GRTUSDT":  ["GRTUSDT", "GRTUSD"],
+    "ONEUSD":   ["ONEUSD", "ONEUSDT"],
+    "ONEUSDT":  ["ONEUSDT", "ONEUSD"],
 
     # ── FX 예시 ──
     "EURUSD": ["EURUSD", "EURUSD.m", "EURUSD.micro"],
@@ -596,7 +623,6 @@ def dynamic_partial_lot(vol_now: float, step: float) -> float:
     if vol_now <= 0:
         return step
     raw = vol_now / 3.0
-    # 스텝에 맞춰 내림
     lot = floor_to_step(raw, step)
     if lot < step:
         lot = step
@@ -784,7 +810,7 @@ def poll_loop():
             res = post_json("/pull", {"agent_key": AGENT_KEY, "max_batch": MAX_BATCH})
             items = res.get("items") or []
             if not items:
-                time.sleep(POLL_INTERVAL_SEC + random.random()*0.7)
+                time.sleep(POLL_INTERVAL_SEC + random.random() * 0.7)
                 consec_fail = 0
                 continue
 
@@ -825,4 +851,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
