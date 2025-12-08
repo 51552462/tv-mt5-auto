@@ -96,7 +96,10 @@ def get_fixed_lot_for_symbol(symbol_hint: str) -> float:
         return 0.3
    
     if key in ("ONEUSD", "ONEUSDT"):
-        return 0.3    
+        return 0.3
+         
+    if key in ("XAUUSD", "GOLD", "XAUUSD.cash", "XAUUSDm"):
+        return 0.6
   # 그 외 심볼은 환경변수 FIXED_ENTRY_LOT 사용
     return FIXED_ENTRY_LOT
 
@@ -851,4 +854,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
