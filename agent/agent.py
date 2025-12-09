@@ -80,10 +80,10 @@ def get_fixed_lot_for_symbol(symbol_hint: str) -> float:
         return 0.3
 
     # 실버(은)
-    if key in ("XAGUSD", "SILVER", "XAGUSD.CASH", "XAGUSDm"):
+    if key in ("XAGUSD", "SILVER", "XAGUSD.CASH", "XAGUSDm", "SI1!"):
         return 0.03
 
-    if key in (["ADAUSD", "ADAUSDT"):
+    if key in ("ADAUSD", "ADAUSDT"):
         return 0.3
 
     if key in ("DOGUSD", "DOGEUSDT"):
@@ -98,7 +98,7 @@ def get_fixed_lot_for_symbol(symbol_hint: str) -> float:
     if key in ("ONEUSD", "ONEUSDT"):
         return 0.3
          
-    if key in ("XAUUSD", "GOLD", "XAUUSD.cash", "XAUUSDm"):
+    if key in ("XAUUSD", "GOLD", "XAUUSD.cash", "XAUUSDm", "GC1!"):
         return 0.06
   # 그 외 심볼은 환경변수 FIXED_ENTRY_LOT 사용
     return FIXED_ENTRY_LOT
@@ -854,7 +854,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
