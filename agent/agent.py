@@ -69,7 +69,7 @@ def get_fixed_lot_for_symbol(symbol_hint: str) -> float:
 
     # 비트코인 계열
     if key in ("BTCUSD", "BTCUSDT", "XBTUSD"):
-        return 0.06
+        return 0.1
 
     # 이더리움 계열
     if key in ("ETHUSD", "ETHUSDT", "XETUSD", "XETHUSD"):
@@ -89,20 +89,20 @@ def get_fixed_lot_for_symbol(symbol_hint: str) -> float:
     if key in ("DOGUSD", "DOGEUSDT"):
         return 0.3
 
-    if key in ("NERUSD", "NEARUSDT"):
-        return 0.3
+    if key in ("BVSPX", "BOVESPA", "IBOV", "IBOVESPA", "BVSPX"):
+        return 0.4
 
-    if key in ("GRTUSD", "GRTUSDT"):
-        return 0.3
+    if key in ("IBEX", "ESP35", "IBEX35", "ES35", "ESP35.cash"):
+        return 1.0
    
-    if key in ("ONEUSD", "ONEUSDT"):
-        return 0.3
+    if key in ("ASX", "AUS200", "ASX200", "AU200", "AUS200.cash"):
+        return 3.0
          
     if key in ("XAUUSD", "GOLD", "XAUUSD.cash", "XAUUSDm", "GC1!"):
         return 0.06
-        
-    if key in ("NAS100", "US100", "USTEC","NQ1!"):
-        return 0.6
+
+    if key in ("NAS100", "US100", "USTEC", "NQ1!"):
+        return 0.5
   # 그 외 심볼은 환경변수 FIXED_ENTRY_LOT 사용
     return FIXED_ENTRY_LOT
 
@@ -857,4 +857,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
