@@ -81,7 +81,7 @@ def get_fixed_lot_for_symbol(symbol_hint: str) -> float:
 
     # 실버(은)
     if key in ("XAGUSD", "SILVER", "XAGUSD.CASH", "XAGUSDm", "SI1!"):
-        return 0.03
+        return 0.02
 
     if key in ("ADAUSD", "ADAUSDT"):
         return 0.3
@@ -857,4 +857,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
