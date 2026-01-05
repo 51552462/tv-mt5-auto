@@ -60,7 +60,7 @@ IGNORE_SIGNAL_CONTRACTS = os.environ.get("IGNORE_SIGNAL_CONTRACTS", "1").strip()
 # 심볼별 고정 랏 설정
 # - BTC : 0.03
 # - ETH : 3.0
-# - SOL : 3.0
+# - SOL : 1
 # - SILVER(XAGUSD 계열) : 0.3
 # - 그 외 : FIXED_ENTRY_LOT (예: 0.3)
 # --------------------------------------------------------------------
@@ -77,7 +77,7 @@ def get_fixed_lot_for_symbol(symbol_hint: str) -> float:
 
     # 솔라나 계열
     if key in ("SOLUSD", "SOLUSDT"):
-        return 0.3
+        return 1
 
     # 실버(은)
     if key in ("XAGUSD", "SILVER", "XAGUSD.CASH", "XAGUSDm", "SI1!"):
@@ -857,6 +857,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
