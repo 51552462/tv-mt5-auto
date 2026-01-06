@@ -80,7 +80,7 @@ def get_fixed_lot_for_symbol(symbol_hint: str) -> float:
         return 0.8
 
     # 실버(은)
-    if key in ("XAGUSD", "SILVER", "XAGUSD.CASH", "XAGUSDm", "SI1!"):
+    if key in ("XAGUSD", "SILVER", "XAGUSD.CASH", "XAGUSDm"):
         return 0.02
 
     if key in ("ADAUSD", "ADAUSDT"):
@@ -147,10 +147,15 @@ FINAL_ALIASES: Dict[str, List[str]] = {
     "SI1!":   ["XAGUSD", "SILVER", "XAGUSD.cash", "XAGUSDm"],
     "CL1!":   ["CL-OIL", "USOIL", "WTI", "OIL", "CL", "CLm"],
     "NG1!":   ["NG", "NATGAS", "GAS", "NGm"],
+   
+   
+    # ✅ (중요) TV가 "GOLD"/"SILVER"로 바로 보내는 경우를 확실히 커버
+    "GOLD":   ["XAUUSD", "XAUUSD.cash", "XAUUSDm", "GC1!", "GOLD"],
+    "SILVER": ["XAGUSD", "XAGUSD.cash", "XAGUSDm", "SI1!", "SILVER"],
 
     # ── 현물 직접 매핑 ──
-    "XAUUSD": ["XAUUSD", "GOLD"],
-    "XAGUSD": ["XAGUSD", "SILVER"],
+    "XAUUSD": ["XAUUSD", "GOLD", "XAUUSD.cash", "XAUUSDm"],
+    "XAGUSD": ["XAGUSD", "SILVER", "XAGUSD.cash", "XAGUSDm"],
 
     # ── 크립토 ──
     "BTCUSD":   ["BTCUSD", "BTCUSDT", "XBTUSD"],
@@ -857,8 +862,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
